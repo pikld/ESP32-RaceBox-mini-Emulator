@@ -8,6 +8,7 @@
 #include <BLE2902.h>
 #include <array>
 #include <cstring>
+#include <limits>
 
 // --- GPS Configuration ---
 constexpr uint32_t kSerialBaudRate = 115200UL;
@@ -245,6 +246,18 @@ void* requireBleObject(void *object, const char *description) {
   }
 
   return object;
+}
+
+int16_t saturatingFloatToInt16(float value) {
+  if (value > static_cast<float>(std::numeric_limits<int16_t>::max())) {
+    return std::numeric_limits<int16_t>::max();
+  }
+
+  if (value < static_cast<float>(std::numeric_limits<int16_t>::min())) {
+    return std::numeric_limits<int16_t>::min();
+  }
+
+  return static_cast<int16_t>(value);
 }
 
 void resetGpsBaudRate() {
@@ -510,14 +523,20 @@ void loop() {
         const auto &navData = navPvtPacket->data;
 
         // Convert accelerometer to milli-g (1g = 9.80665 m/s^2)
-        const int16_t gX = filtered_ax * kAccelerationToMilliG;
-        const int16_t gY = filtered_ay * kAccelerationToMilliG;
-        const int16_t gZ = filtered_az * kAccelerationToMilliG;
+        const float accelXMilliG = filtered_ax * kAccelerationToMilliG;
+        const float accelYMilliG = filtered_ay * kAccelerationToMilliG;
+        const float accelZMilliG = filtered_az * kAccelerationToMilliG;
+        const int16_t gX = saturatingFloatToInt16(accelXMilliG);
+        const int16_t gY = saturatingFloatToInt16(accelYMilliG);
+        const int16_t gZ = saturatingFloatToInt16(accelZMilliG);
 
         // Convert gyro to centi-deg/sec
-        const int16_t rX = filtered_gx * kGyroRadiansToCentiDegrees;
-        const int16_t rY = filtered_gy * kGyroRadiansToCentiDegrees;
-        const int16_t rZ = filtered_gz * kGyroRadiansToCentiDegrees;
+        const float gyroXCentiDegrees = filtered_gx * kGyroRadiansToCentiDegrees;
+        const float gyroYCentiDegrees = filtered_gy * kGyroRadiansToCentiDegrees;
+        const float gyroZCentiDegrees = filtered_gz * kGyroRadiansToCentiDegrees;
+        const int16_t rX = saturatingFloatToInt16(gyroXCentiDegrees);
+        const int16_t rY = saturatingFloatToInt16(gyroYCentiDegrees);
+        const int16_t rZ = saturatingFloatToInt16(gyroZCentiDegrees);
 
         uint8_t *payload = txPayloadBuffer.data();
         uint8_t *packet = txPacketBuffer.data();
