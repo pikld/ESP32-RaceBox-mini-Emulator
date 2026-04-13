@@ -179,7 +179,9 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
     // Request a larger MTU to fit an 88-byte packet + headers in one go
-    pServer->updatePeerMTU(pServer->getConnId(), kRequestedBleMtu); 
+    if (pServer != NULL) {
+      pServer->updatePeerMTU(pServer->getConnId(), kRequestedBleMtu);
+    }
     digitalWrite(kOnboardLedPin, HIGH);
     Serial.println("✅ BLE Client connected & MTU update requested");
   }
@@ -192,10 +194,14 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
 class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
+    if (pCharacteristic == NULL) {
+      return;
+    }
+
     uint8_t *rxValue = pCharacteristic->getData();
     const size_t rxLength = pCharacteristic->getLength();
 
-    if (rxLength > 0U) {
+    if ((rxValue != NULL) && (rxLength > 0U)) {
       Serial.print("📨 Received BLE command: ");
       for (size_t i = 0; i < rxLength; ++i) {
         Serial.printf("0x%02X ", rxValue[i]);
@@ -223,6 +229,18 @@ void calculateChecksum(uint8_t* payload, uint16_t len, uint8_t cls, uint8_t id, 
     *ckA += payload[i];
     *ckB += *ckA;
   }
+}
+
+void* requireBleObject(void *object, const char *description) {
+  if (object == NULL) {
+    Serial.print("❌ Failed to create ");
+    Serial.println(description);
+    while (1) {
+      delay(100);
+    }
+  }
+
+  return object;
 }
 
 void resetGpsBaudRate() {
@@ -389,34 +407,34 @@ void setup() {
 
   // --- BLE Setup ---
   BLEDevice::init(kDeviceName);
-  pServer = BLEDevice::createServer();
+  pServer = static_cast<BLEServer*>(requireBleObject(BLEDevice::createServer(), "BLE server"));
   pServer->setCallbacks(new MyServerCallbacks());
 
-  BLEService *pService = pServer->createService(kRaceBoxServiceUuid);
-  pCharacteristicTx = pService->createCharacteristic(kRaceBoxCharacteristicTxUuid, BLECharacteristic::PROPERTY_NOTIFY);
-  pCharacteristicTx->addDescriptor(new BLE2902());
-  pCharacteristicRx = pService->createCharacteristic(kRaceBoxCharacteristicRxUuid, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  BLEService *pService = static_cast<BLEService*>(requireBleObject(pServer->createService(kRaceBoxServiceUuid), "RaceBox BLE service"));
+  pCharacteristicTx = static_cast<BLECharacteristic*>(requireBleObject(pService->createCharacteristic(kRaceBoxCharacteristicTxUuid, BLECharacteristic::PROPERTY_NOTIFY), "RaceBox TX characteristic"));
+  pCharacteristicTx->addDescriptor(static_cast<BLE2902*>(requireBleObject(new BLE2902(), "RaceBox TX descriptor")));
+  pCharacteristicRx = static_cast<BLECharacteristic*>(requireBleObject(pService->createCharacteristic(kRaceBoxCharacteristicRxUuid, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR), "RaceBox RX characteristic"));
   pCharacteristicRx->setCallbacks(new MyCharacteristicCallbacks());
   pService->start();
   // --- Device Information Service ---
-  BLEService *pDeviceInfo = pServer->createService(kDeviceInfoServiceUuid);
+  BLEService *pDeviceInfo = static_cast<BLEService*>(requireBleObject(pServer->createService(kDeviceInfoServiceUuid), "Device Information service"));
   // Model
-  BLECharacteristic *pModel = pDeviceInfo->createCharacteristic(kModelCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  BLECharacteristic *pModel = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kModelCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device model characteristic"));
   pModel->setValue(kModelName);
   // Serial number (last 10 digits of device name)
-  BLECharacteristic *pSerial = pDeviceInfo->createCharacteristic(kSerialCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  BLECharacteristic *pSerial = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kSerialCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device serial characteristic"));
   pSerial->setValue(reinterpret_cast<uint8_t*>(deviceSerialNumber), kDeviceNameSuffixLength);
   // Firmware revision
-  BLECharacteristic *pFirm = pDeviceInfo->createCharacteristic(kFirmwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  BLECharacteristic *pFirm = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kFirmwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device firmware characteristic"));
   pFirm->setValue(kFirmwareRevision);
   // Hardware revision
-  BLECharacteristic *pHardware = pDeviceInfo->createCharacteristic(kHardwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  BLECharacteristic *pHardware = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kHardwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device hardware characteristic"));
   pHardware->setValue(kHardwareRevision);
   // Manufacturer
-  BLECharacteristic *pManufacturer = pDeviceInfo->createCharacteristic(kManufacturerCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  BLECharacteristic *pManufacturer = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kManufacturerCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device manufacturer characteristic"));
   pManufacturer->setValue(kManufacturerName);
   pDeviceInfo->start();
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  BLEAdvertising *pAdvertising = static_cast<BLEAdvertising*>(requireBleObject(BLEDevice::getAdvertising(), "BLE advertising"));
   pAdvertising->addServiceUUID(kRaceBoxServiceUuid);
   // Advertise Device Information Service to help official apps discover the device
   pAdvertising->addServiceUUID(kDeviceInfoServiceUuid);
@@ -457,14 +475,19 @@ void loop() {
     digitalWrite(kOnboardLedPin, HIGH);
   }
   if (myGNSS.getPVT()) {
+    const UBX_NAV_PVT_t *navPvtPacket = myGNSS.packetUBXNAVPVT;
     static uint32_t lastITOW = 0;
-    uint32_t currentITOW = myGNSS.packetUBXNAVPVT->data.iTOW;
+    uint32_t currentITOW = 0;
 
-    if (currentITOW != lastITOW) {
+    if (navPvtPacket != NULL) {
+      currentITOW = navPvtPacket->data.iTOW;
+    }
+
+    if ((navPvtPacket != NULL) && (currentITOW != lastITOW)) {
       lastITOW = currentITOW;
       gnssUpdateCount++;
 
-      if (deviceConnected && myGNSS.packetUBXNAVPVT != NULL) {
+      if (deviceConnected && (pCharacteristicTx != NULL)) {
         const unsigned long now = millis();
         lastPacketSendTime = now;
         gpsUpdateCount++;
@@ -482,35 +505,35 @@ void loop() {
         uint8_t *payload = txPayloadBuffer.data();
         uint8_t *packet = txPacketBuffer.data();
 
-        // Access data directly from myGNSS.packetUBXNAVPVT->data
-        writeLittleEndian(payload, kPayloadOffsetITow, myGNSS.packetUBXNAVPVT->data.iTOW);
-        writeLittleEndian(payload, kPayloadOffsetYear, myGNSS.packetUBXNAVPVT->data.year);
-        writeLittleEndian(payload, kPayloadOffsetMonth, myGNSS.packetUBXNAVPVT->data.month);
-        writeLittleEndian(payload, kPayloadOffsetDay, myGNSS.packetUBXNAVPVT->data.day);
-        writeLittleEndian(payload, kPayloadOffsetHour, myGNSS.packetUBXNAVPVT->data.hour);
-        writeLittleEndian(payload, kPayloadOffsetMinute, myGNSS.packetUBXNAVPVT->data.min);
-        writeLittleEndian(payload, kPayloadOffsetSecond, myGNSS.packetUBXNAVPVT->data.sec);
+        // Access data directly from navPvtPacket->data
+        writeLittleEndian(payload, kPayloadOffsetITow, navPvtPacket->data.iTOW);
+        writeLittleEndian(payload, kPayloadOffsetYear, navPvtPacket->data.year);
+        writeLittleEndian(payload, kPayloadOffsetMonth, navPvtPacket->data.month);
+        writeLittleEndian(payload, kPayloadOffsetDay, navPvtPacket->data.day);
+        writeLittleEndian(payload, kPayloadOffsetHour, navPvtPacket->data.hour);
+        writeLittleEndian(payload, kPayloadOffsetMinute, navPvtPacket->data.min);
+        writeLittleEndian(payload, kPayloadOffsetSecond, navPvtPacket->data.sec);
 
         // Offset 11: Validity Flags (RaceBox Protocol) 
         uint8_t raceboxValidityFlags = 0;
-        if (myGNSS.packetUBXNAVPVT->data.valid.bits.validDate) raceboxValidityFlags |= (1 << 0); // Bit 0: valid date 
-        if (myGNSS.packetUBXNAVPVT->data.valid.bits.validTime) raceboxValidityFlags |= (1 << 1); // Bit 1: valid time 
-        if (myGNSS.packetUBXNAVPVT->data.valid.bits.fullyResolved) raceboxValidityFlags |= (1 << 2); // Bit 2: fully resolved 
+        if (navPvtPacket->data.valid.bits.validDate) raceboxValidityFlags |= (1 << 0); // Bit 0: valid date 
+        if (navPvtPacket->data.valid.bits.validTime) raceboxValidityFlags |= (1 << 1); // Bit 1: valid time 
+        if (navPvtPacket->data.valid.bits.fullyResolved) raceboxValidityFlags |= (1 << 2); // Bit 2: fully resolved 
         writeLittleEndian(payload, kPayloadOffsetValidityFlags, raceboxValidityFlags);
 
         // Offset 12: Time Accuracy (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetTimeAccuracy, myGNSS.packetUBXNAVPVT->data.tAcc);
+        writeLittleEndian(payload, kPayloadOffsetTimeAccuracy, navPvtPacket->data.tAcc);
 
         // Offset 16: Nanoseconds (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetNanoseconds, myGNSS.packetUBXNAVPVT->data.nano);
+        writeLittleEndian(payload, kPayloadOffsetNanoseconds, navPvtPacket->data.nano);
 
         // Offset 20: Fix Status (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetFixType, myGNSS.packetUBXNAVPVT->data.fixType);
+        writeLittleEndian(payload, kPayloadOffsetFixType, navPvtPacket->data.fixType);
 
         // Offset 21: Fix Status Flags (RaceBox Protocol)
         uint8_t fixStatusFlagsRacebox = 0;
 
-        if (myGNSS.packetUBXNAVPVT->data.fixType == 3) {
+        if (navPvtPacket->data.fixType == 3) {
             fixStatusFlagsRacebox |= (1 << 0); // Bit 0: valid fix
         }
 
@@ -521,32 +544,32 @@ void loop() {
 
         // Offset 22: Date/Time Flags (RaceBox Protocol) 
         uint8_t raceboxDateTimeFlags = 0;
-        if (myGNSS.packetUBXNAVPVT->data.valid.bits.validTime) raceboxDateTimeFlags |= (1 << 5); // Available confirmation of Date/Time Validity
-        if (myGNSS.packetUBXNAVPVT->data.valid.bits.validDate) raceboxDateTimeFlags |= (1 << 6); // Confirmed UTC Date Validity
-        if (myGNSS.packetUBXNAVPVT->data.valid.bits.validTime && myGNSS.packetUBXNAVPVT->data.valid.bits.fullyResolved) raceboxDateTimeFlags |= (1 << 7); // Confirmed UTC Time Validity
+        if (navPvtPacket->data.valid.bits.validTime) raceboxDateTimeFlags |= (1 << 5); // Available confirmation of Date/Time Validity
+        if (navPvtPacket->data.valid.bits.validDate) raceboxDateTimeFlags |= (1 << 6); // Confirmed UTC Date Validity
+        if (navPvtPacket->data.valid.bits.validTime && navPvtPacket->data.valid.bits.fullyResolved) raceboxDateTimeFlags |= (1 << 7); // Confirmed UTC Time Validity
         writeLittleEndian(payload, kPayloadOffsetDateTimeFlags, raceboxDateTimeFlags);
 
         // Offset 23: Number of SVs (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetNumSv, myGNSS.packetUBXNAVPVT->data.numSV);
+        writeLittleEndian(payload, kPayloadOffsetNumSv, navPvtPacket->data.numSV);
 
         // Remaining fields, mostly direct mappings from u-blox data
-        writeLittleEndian(payload, kPayloadOffsetLongitude, myGNSS.packetUBXNAVPVT->data.lon);
-        writeLittleEndian(payload, kPayloadOffsetLatitude, myGNSS.packetUBXNAVPVT->data.lat);
-        writeLittleEndian(payload, kPayloadOffsetHeight, myGNSS.packetUBXNAVPVT->data.height);
-        writeLittleEndian(payload, kPayloadOffsetHmsl, myGNSS.packetUBXNAVPVT->data.hMSL);
+        writeLittleEndian(payload, kPayloadOffsetLongitude, navPvtPacket->data.lon);
+        writeLittleEndian(payload, kPayloadOffsetLatitude, navPvtPacket->data.lat);
+        writeLittleEndian(payload, kPayloadOffsetHeight, navPvtPacket->data.height);
+        writeLittleEndian(payload, kPayloadOffsetHmsl, navPvtPacket->data.hMSL);
 
-        writeLittleEndian(payload, kPayloadOffsetHorizontalAccuracy, myGNSS.packetUBXNAVPVT->data.hAcc);
-        writeLittleEndian(payload, kPayloadOffsetVerticalAccuracy, myGNSS.packetUBXNAVPVT->data.vAcc);
-        writeLittleEndian(payload, kPayloadOffsetGroundSpeed, myGNSS.packetUBXNAVPVT->data.gSpeed);
-        writeLittleEndian(payload, kPayloadOffsetHeadingOfMotion, myGNSS.packetUBXNAVPVT->data.headMot);
-        writeLittleEndian(payload, kPayloadOffsetSpeedAccuracy, myGNSS.packetUBXNAVPVT->data.sAcc);
-        writeLittleEndian(payload, kPayloadOffsetHeadingAccuracy, myGNSS.packetUBXNAVPVT->data.headAcc);
+        writeLittleEndian(payload, kPayloadOffsetHorizontalAccuracy, navPvtPacket->data.hAcc);
+        writeLittleEndian(payload, kPayloadOffsetVerticalAccuracy, navPvtPacket->data.vAcc);
+        writeLittleEndian(payload, kPayloadOffsetGroundSpeed, navPvtPacket->data.gSpeed);
+        writeLittleEndian(payload, kPayloadOffsetHeadingOfMotion, navPvtPacket->data.headMot);
+        writeLittleEndian(payload, kPayloadOffsetSpeedAccuracy, navPvtPacket->data.sAcc);
+        writeLittleEndian(payload, kPayloadOffsetHeadingAccuracy, navPvtPacket->data.headAcc);
 
-        writeLittleEndian(payload, kPayloadOffsetPdop, myGNSS.packetUBXNAVPVT->data.pDOP);
+        writeLittleEndian(payload, kPayloadOffsetPdop, navPvtPacket->data.pDOP);
 
         // Offset 66: Lat/Lon Flags (RaceBox Protocol) 
         uint8_t latLonFlags = 0;
-        if (myGNSS.packetUBXNAVPVT->data.fixType < 2) { // If no 2D/3D fix, then coordinates are considered invalid 
+        if (navPvtPacket->data.fixType < 2) { // If no 2D/3D fix, then coordinates are considered invalid 
             latLonFlags |= (1 << 0); // Bit 0: Invalid Latitude, Longitude, WGS Altitude, and MSL Altitude
         }
         writeLittleEndian(payload, kPayloadOffsetLatLonFlags, latLonFlags);
@@ -584,12 +607,12 @@ void loop() {
       uint8_t fix = 0;
       uint32_t hAcc = 0;
       double lat = 0.0, lon = 0.0;
-      if (myGNSS.packetUBXNAVPVT != NULL) {
-        sats = myGNSS.packetUBXNAVPVT->data.numSV;
-        fix = myGNSS.packetUBXNAVPVT->data.fixType;
-        hAcc = myGNSS.packetUBXNAVPVT->data.hAcc;
-        lat = myGNSS.packetUBXNAVPVT->data.lat * 1e-7;
-        lon = myGNSS.packetUBXNAVPVT->data.lon * 1e-7;
+      if (navPvtPacket != NULL) {
+        sats = navPvtPacket->data.numSV;
+        fix = navPvtPacket->data.fixType;
+        hAcc = navPvtPacket->data.hAcc;
+        lat = navPvtPacket->data.lat * 1e-7;
+        lon = navPvtPacket->data.lon * 1e-7;
       }
       Serial.printf("BLE Packet Rate: %.2f Hz | GNSS Update Rate: %.2f Hz | SVs: %u | Fix: %u | HAcc: %u mm | Lat: %.7f Lon: %.7f\n",
                     bleRate, gnssRate, sats, fix, hAcc, lat, lon);
@@ -600,7 +623,9 @@ void loop() {
 
     if (!deviceConnected && oldDeviceConnected) {
       delay(kRestartAdvertisingDelayMs);
-      pServer->startAdvertising();
+      if (pServer != NULL) {
+        pServer->startAdvertising();
+      }
       oldDeviceConnected = deviceConnected;
     }
     if (deviceConnected && !oldDeviceConnected) {
