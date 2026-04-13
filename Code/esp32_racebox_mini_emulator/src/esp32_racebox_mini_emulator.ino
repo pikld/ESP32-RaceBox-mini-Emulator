@@ -446,29 +446,39 @@ void setup() {
 }
 
 void loop() {
+  const unsigned long now = millis();
   myGNSS.checkUblox(); // Required to keep GNSS data flowing
   static unsigned long lastAccelReadMs = 0;
+
+  if (lastAccelReadMs == 0UL) {
+    lastAccelReadMs = now;
+  }
+
   // Update Accelrometer readings at fixed interval
-  if (millis() - lastAccelReadMs >= kAccelSampleIntervalMs) {
-    lastAccelReadMs += kAccelSampleIntervalMs; // Strict timing grid
-      lastAccelReadMs = millis();
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
+  bool shouldReadAccel = false;
+  while ((now - lastAccelReadMs) >= kAccelSampleIntervalMs) {
+    lastAccelReadMs += kAccelSampleIntervalMs; // Stay on the fixed timing grid if the loop slips.
+    shouldReadAccel = true;
+  }
 
-      // Apply Exponential Moving Average (Complementary Filter logic)
-      filtered_ax = (accelAlpha * a.acceleration.x) + ((1.0 - accelAlpha) * filtered_ax);
-      filtered_ay = (accelAlpha * a.acceleration.y) + ((1.0 - accelAlpha) * filtered_ay);
-      filtered_az = (accelAlpha * a.acceleration.z) + ((1.0 - accelAlpha) * filtered_az);
+  if (shouldReadAccel) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
-      filtered_gx = (gyroAlpha * g.gyro.x) + ((1.0 - gyroAlpha) * filtered_gx);
-      filtered_gy = (gyroAlpha * g.gyro.y) + ((1.0 - gyroAlpha) * filtered_gy);
-      filtered_gz = (gyroAlpha * g.gyro.z) + ((1.0 - gyroAlpha) * filtered_gz);
+    // Apply Exponential Moving Average (Complementary Filter logic)
+    filtered_ax = (accelAlpha * a.acceleration.x) + ((1.0 - accelAlpha) * filtered_ax);
+    filtered_ay = (accelAlpha * a.acceleration.y) + ((1.0 - accelAlpha) * filtered_ay);
+    filtered_az = (accelAlpha * a.acceleration.z) + ((1.0 - accelAlpha) * filtered_az);
+
+    filtered_gx = (gyroAlpha * g.gyro.x) + ((1.0 - gyroAlpha) * filtered_gx);
+    filtered_gy = (gyroAlpha * g.gyro.y) + ((1.0 - gyroAlpha) * filtered_gy);
+    filtered_gz = (gyroAlpha * g.gyro.z) + ((1.0 - gyroAlpha) * filtered_gz);
   }
   // LED Blink Logic
   if (!deviceConnected) {
     static unsigned long lastBlinkMs = 0;
-    if (millis() - lastBlinkMs > kDisconnectedBlinkIntervalMs) {
-      lastBlinkMs = millis();
+    if ((now - lastBlinkMs) > kDisconnectedBlinkIntervalMs) {
+      lastBlinkMs = now;
       digitalWrite(kOnboardLedPin, !digitalRead(kOnboardLedPin));
     }
   } else {
@@ -488,7 +498,6 @@ void loop() {
       gnssUpdateCount++;
 
       if (deviceConnected && (pCharacteristicTx != NULL)) {
-        const unsigned long now = millis();
         lastPacketSendTime = now;
         gpsUpdateCount++;
 
@@ -598,7 +607,6 @@ void loop() {
     }
 
     // Report packet send rate
-    const unsigned long now = millis();
     if ((now - lastGpsRateCheckTime) >= kGpsRateReportIntervalMs) {
       float bleRate = gpsUpdateCount / (kGpsRateReportIntervalMs / 1000.0);
       float gnssRate = gnssUpdateCount / (kGpsRateReportIntervalMs / 1000.0);
