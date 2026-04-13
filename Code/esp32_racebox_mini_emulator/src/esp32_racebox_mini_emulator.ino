@@ -6,15 +6,17 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <array>
+#include <cstring>
 #include <string>
-#include <vector>
 
 // --- GPS Configuration ---
-#define GPS_RX_PIN 16
-#define GPS_TX_PIN 17
-#define GPS_BAUD 115200
-#define FACTORY_GPS_BAUD 9600
-#define MAX_NAVIGATION_RATE 25
+constexpr uint32_t kSerialBaudRate = 115200UL;
+constexpr int kGpsRxPin = 16;
+constexpr int kGpsTxPin = 17;
+constexpr uint32_t kGpsBaudRate = 115200UL;
+constexpr uint32_t kFactoryGpsBaudRate = 9600UL;
+constexpr uint8_t kMaxNavigationRateHz = 25U;
 
 SFE_UBLOX_GNSS myGNSS;
 HardwareSerial GPS_Serial(2);
@@ -29,28 +31,43 @@ HardwareSerial GPS_Serial(2);
 // #define ENABLE_GNSS_SBAS
 // #define ENABLE_GNSS_QZSS
 
-constexpr const char* rawDeviceName = "RaceBox Mini 0123456789";
+constexpr char kDeviceName[] = "RaceBox Mini 0123456789";
+constexpr size_t kDeviceNamePrefixLength = sizeof("RaceBox Mini ") - 1U;
+constexpr size_t kDeviceNameSuffixLength = 10U;
+constexpr unsigned long kMaxAllowedDeviceSuffix = 3999999999UL;
 
-constexpr unsigned long MAX_ALLOWED = 3999999999;
-
-constexpr unsigned long parseSuffix(const char* name) {
-    unsigned long val = 0;
-    // The suffix starts at index 13 (after "RaceBox Mini ")
-    for (int i = 13; i < 23; ++i) {
-        val = val * 10 + (name[i] - '0');
-    }
-    return val;
+constexpr bool isDigit(char value) {
+  return (value >= '0') && (value <= '9');
 }
 
-static_assert(parseSuffix(rawDeviceName) <= MAX_ALLOWED, 
-              "ERROR: RaceBox Mini number cannot exceed 3999999999 for compatibility with the official RaceBox App");
+constexpr unsigned long pow10(unsigned int exponent) {
+  return (exponent == 0U) ? 1UL : 10UL * pow10(exponent - 1U);
+}
 
-const String deviceName = rawDeviceName;
+constexpr bool deviceNameSuffixIsDigits(const char* name, unsigned int index, unsigned int remaining) {
+  return (remaining == 0U) ? true : (isDigit(name[index]) && deviceNameSuffixIsDigits(name, index + 1U, remaining - 1U));
+}
 
-const int OnboardledPin = 2;
+constexpr unsigned long parseDeviceNameSuffix(const char* name, unsigned int index, unsigned int remaining) {
+  return (remaining == 0U)
+             ? 0UL
+             : (static_cast<unsigned long>(name[index] - '0') * pow10(remaining - 1U)) +
+                   parseDeviceNameSuffix(name, index + 1U, remaining - 1U);
+}
+
+static_assert(sizeof(kDeviceName) == (kDeviceNamePrefixLength + kDeviceNameSuffixLength + 1U),
+              "Device name must be 'RaceBox Mini ' followed by 10 digits.");
+static_assert(deviceNameSuffixIsDigits(kDeviceName, kDeviceNamePrefixLength, kDeviceNameSuffixLength),
+              "Device name suffix must contain digits only.");
+static_assert(parseDeviceNameSuffix(kDeviceName, kDeviceNamePrefixLength, kDeviceNameSuffixLength) <= kMaxAllowedDeviceSuffix,
+              "RaceBox Mini number cannot exceed 3999999999 for compatibility with the official RaceBox app.");
+
+const String deviceName = kDeviceName;
+
+constexpr int kOnboardLedPin = 2;
 
 Adafruit_MPU6050 mpu;
-const unsigned long AccelSampleInterval = 10; // 10ms = 100Hz
+constexpr uint32_t kAccelSampleIntervalMs = 10UL; // 10ms = 100Hz
 // --- Smoothing Configuration ---
 // alpha = 1.0: No filtering (raw data)
 // alpha = 0.5: 50% current reading, 50% previous (moderate)
@@ -62,9 +79,20 @@ float filtered_ax = 0, filtered_ay = 0, filtered_az = 0;
 float filtered_gx = 0, filtered_gy = 0, filtered_gz = 0;
 
 // --- BLE Configuration ---
-const char* const RACEBOX_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-const char* const RACEBOX_CHARACTERISTIC_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-const char* const RACEBOX_CHARACTERISTIC_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kRaceBoxServiceUuid[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kRaceBoxCharacteristicRxUuid[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kRaceBoxCharacteristicTxUuid[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kDeviceInfoServiceUuid[] = "0000180a-0000-1000-8000-00805f9b34fb";
+constexpr char kModelCharacteristicUuid[] = "00002a24-0000-1000-8000-00805f9b34fb";
+constexpr char kSerialCharacteristicUuid[] = "00002a25-0000-1000-8000-00805f9b34fb";
+constexpr char kFirmwareCharacteristicUuid[] = "00002a26-0000-1000-8000-00805f9b34fb";
+constexpr char kHardwareCharacteristicUuid[] = "00002a27-0000-1000-8000-00805f9b34fb";
+constexpr char kManufacturerCharacteristicUuid[] = "00002a29-0000-1000-8000-00805f9b34fb";
+constexpr char kModelName[] = "RaceBox Mini";
+constexpr char kFirmwareRevision[] = "3.3";
+constexpr char kHardwareRevision[] = "1";
+constexpr char kManufacturerName[] = "RaceBox";
+constexpr uint16_t kRequestedBleMtu = 128U;
 
 BLEServer *pServer = NULL;
 BLECharacteristic *pCharacteristicTx = NULL;
@@ -74,11 +102,67 @@ bool oldDeviceConnected = false;
 
 // --- Packet Timing ---
 unsigned long lastPacketSendTime = 0;
-const unsigned long PACKET_SEND_INTERVAL_MS = 40;
+constexpr uint32_t kPacketSendIntervalMs = 40UL;
 unsigned long lastGpsRateCheckTime = 0;
 unsigned int gpsUpdateCount = 0;
-const unsigned long GPS_RATE_REPORT_INTERVAL_MS = 5000;
+constexpr uint32_t kGpsRateReportIntervalMs = 5000UL;
 unsigned int gnssUpdateCount = 0;
+constexpr uint32_t kDisconnectedBlinkIntervalMs = 500UL;
+constexpr uint32_t kRestartAdvertisingDelayMs = 500UL;
+
+// --- RaceBox Packet Layout ---
+constexpr uint8_t kUbxSyncChar1 = 0xB5U;
+constexpr uint8_t kUbxSyncChar2 = 0x62U;
+constexpr uint8_t kRaceBoxMessageClass = 0xFFU;
+constexpr uint8_t kRaceBoxMessageId = 0x01U;
+constexpr size_t kRaceBoxHeaderSize = 6U;
+constexpr size_t kRaceBoxPayloadSize = 80U;
+constexpr size_t kRaceBoxChecksumSize = 2U;
+constexpr size_t kRaceBoxPacketSize = kRaceBoxHeaderSize + kRaceBoxPayloadSize + kRaceBoxChecksumSize;
+constexpr int kPacketPayloadOffset = 6;
+constexpr int kPacketChecksumOffset = kPacketPayloadOffset + static_cast<int>(kRaceBoxPayloadSize);
+
+constexpr int kPayloadOffsetITow = 0;
+constexpr int kPayloadOffsetYear = 4;
+constexpr int kPayloadOffsetMonth = 6;
+constexpr int kPayloadOffsetDay = 7;
+constexpr int kPayloadOffsetHour = 8;
+constexpr int kPayloadOffsetMinute = 9;
+constexpr int kPayloadOffsetSecond = 10;
+constexpr int kPayloadOffsetValidityFlags = 11;
+constexpr int kPayloadOffsetTimeAccuracy = 12;
+constexpr int kPayloadOffsetNanoseconds = 16;
+constexpr int kPayloadOffsetFixType = 20;
+constexpr int kPayloadOffsetFixStatusFlags = 21;
+constexpr int kPayloadOffsetDateTimeFlags = 22;
+constexpr int kPayloadOffsetNumSv = 23;
+constexpr int kPayloadOffsetLongitude = 24;
+constexpr int kPayloadOffsetLatitude = 28;
+constexpr int kPayloadOffsetHeight = 32;
+constexpr int kPayloadOffsetHmsl = 36;
+constexpr int kPayloadOffsetHorizontalAccuracy = 40;
+constexpr int kPayloadOffsetVerticalAccuracy = 44;
+constexpr int kPayloadOffsetGroundSpeed = 48;
+constexpr int kPayloadOffsetHeadingOfMotion = 52;
+constexpr int kPayloadOffsetSpeedAccuracy = 56;
+constexpr int kPayloadOffsetHeadingAccuracy = 60;
+constexpr int kPayloadOffsetPdop = 64;
+constexpr int kPayloadOffsetLatLonFlags = 66;
+constexpr int kPayloadOffsetBatteryStatus = 67;
+constexpr int kPayloadOffsetAccelX = 68;
+constexpr int kPayloadOffsetAccelY = 70;
+constexpr int kPayloadOffsetAccelZ = 72;
+constexpr int kPayloadOffsetGyroX = 74;
+constexpr int kPayloadOffsetGyroY = 76;
+constexpr int kPayloadOffsetGyroZ = 78;
+constexpr uint8_t kReportedBatteryPercent = 100U;
+
+static_assert(kRaceBoxPacketSize == (kRaceBoxHeaderSize + kRaceBoxPayloadSize + kRaceBoxChecksumSize),
+              "RaceBox packet size must match header + payload + checksum.");
+static_assert(kPacketChecksumOffset + static_cast<int>(kRaceBoxChecksumSize) == static_cast<int>(kRaceBoxPacketSize),
+              "RaceBox checksum offset must point to the final two bytes.");
+static_assert(kPayloadOffsetGyroZ + static_cast<int>(sizeof(int16_t)) == static_cast<int>(kRaceBoxPayloadSize),
+              "RaceBox payload layout no longer ends at gyro Z.");
 
 
 // --- BLE Callbacks ---
@@ -86,13 +170,13 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
     // Request a larger MTU to fit an 88-byte packet + headers in one go
-    pServer->updatePeerMTU(pServer->getConnId(), 128); 
-    digitalWrite(OnboardledPin, HIGH);
+    pServer->updatePeerMTU(pServer->getConnId(), kRequestedBleMtu); 
+    digitalWrite(kOnboardLedPin, HIGH);
     Serial.println("✅ BLE Client connected & MTU update requested");
   }
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
-    digitalWrite(OnboardledPin, LOW);
+    digitalWrite(kOnboardLedPin, LOW);
     Serial.println("❌ BLE Client disconnected");
   }
 };
@@ -133,53 +217,53 @@ void calculateChecksum(uint8_t* payload, uint16_t len, uint8_t cls, uint8_t id, 
 
 void resetGpsBaudRate() {
   Serial.println("Attempting to set Correct Baud Rate");
-  GPS_Serial.begin(FACTORY_GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  GPS_Serial.begin(kFactoryGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   delay(500);
 
   if (!myGNSS.begin(GPS_Serial)) {
     Serial.print("u-blox GNSS not detected at ");
-    Serial.print(FACTORY_GPS_BAUD);
+    Serial.print(kFactoryGpsBaudRate);
     Serial.println(" baud.");
     Serial.print("u-blox GNSS not detected, Check documentation for factory baud rate and/or check your wiring");
     while(1) delay(100);
   } else {
     Serial.print("GNSS detected at ");
-    Serial.print(FACTORY_GPS_BAUD);
+    Serial.print(kFactoryGpsBaudRate);
     Serial.println(" baud!");
   }
   delay(500);
 
   // Now switch baud rate
   Serial.print("Setting baud rate to ");
-  Serial.print(GPS_BAUD);
+  Serial.print(kGpsBaudRate);
   Serial.println("...");
-  myGNSS.setSerialRate(GPS_BAUD);
+  myGNSS.setSerialRate(kGpsBaudRate);
   Serial.print("Baud rate changed to ");
-  Serial.println(GPS_BAUD);
+  Serial.println(kGpsBaudRate);
 
   GPS_Serial.end();
   delay(100);
   // Re-initialize the serial port at the new baud rate
-  GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   delay(500);
 
   if (!myGNSS.begin(GPS_Serial)) {
     Serial.print("GNSS not detected at ");
-    Serial.print(GPS_BAUD);
+    Serial.print(kGpsBaudRate);
     Serial.println(" baud.");
     Serial.print("u-blox GNSS not detected, Check documentation for factory baud rate and/or check your wiring");
     while (1) delay(100);
   }
   Serial.print("GNSS detected at ");
-  Serial.print(GPS_BAUD);
+  Serial.print(kGpsBaudRate);
   Serial.println(" baud! Saving to Flash");
   myGNSS.saveConfiguration(); // Save to flash
   GPS_Serial.end();
 }
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(OnboardledPin, OUTPUT);
+  Serial.begin(kSerialBaudRate);
+  pinMode(kOnboardLedPin, OUTPUT);
   if (!mpu.begin()) {
     Serial.println("❌ Failed to find MPU6050 chip");
     while (1) delay(100);
@@ -195,20 +279,20 @@ void setup() {
   filtered_ay = a.acceleration.y;
   filtered_az = a.acceleration.z;
 
-  GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   if (!myGNSS.begin(GPS_Serial)) {
     Serial.println("❌ GNSS not detected. Attempting to configure.");
     GPS_Serial.end();
     resetGpsBaudRate();
-    GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   }
 
   // Set GNSS output to PVT only
   myGNSS.setAutoPVT(true);
   myGNSS.setDynamicModel(DYN_MODEL_AUTOMOTIVE);
-    // --- Configure GPS update rate to MAX_NAVIGATION_RATE Hz ---
-  if (myGNSS.setNavigationFrequency(MAX_NAVIGATION_RATE)) {
-  Serial.printf("✅ GPS update rate set to %d Hz.\n",MAX_NAVIGATION_RATE );
+    // --- Configure GPS update rate to kMaxNavigationRateHz Hz ---
+  if (myGNSS.setNavigationFrequency(kMaxNavigationRateHz)) {
+  Serial.printf("✅ GPS update rate set to %d Hz.\n",kMaxNavigationRateHz );
   } else {
     Serial.println("❌ Failed to set GPS update rate.");
   }
@@ -292,38 +376,38 @@ void setup() {
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
-  BLEService *pService = pServer->createService(RACEBOX_SERVICE_UUID);
-  pCharacteristicTx = pService->createCharacteristic(RACEBOX_CHARACTERISTIC_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  BLEService *pService = pServer->createService(kRaceBoxServiceUuid);
+  pCharacteristicTx = pService->createCharacteristic(kRaceBoxCharacteristicTxUuid, BLECharacteristic::PROPERTY_NOTIFY);
   pCharacteristicTx->addDescriptor(new BLE2902());
-  pCharacteristicRx = pService->createCharacteristic(RACEBOX_CHARACTERISTIC_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pCharacteristicRx = pService->createCharacteristic(kRaceBoxCharacteristicRxUuid, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   pCharacteristicRx->setCallbacks(new MyCharacteristicCallbacks());
   pService->start();
   // --- Device Information Service ---
-  BLEService *pDeviceInfo = pServer->createService("0000180a-0000-1000-8000-00805f9b34fb");
+  BLEService *pDeviceInfo = pServer->createService(kDeviceInfoServiceUuid);
   // Model
-  BLECharacteristic *pModel = pDeviceInfo->createCharacteristic("00002a24-0000-1000-8000-00805f9b34fb", BLECharacteristic::PROPERTY_READ);
-  pModel->setValue("RaceBox Mini");
+  BLECharacteristic *pModel = pDeviceInfo->createCharacteristic(kModelCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  pModel->setValue(kModelName);
   // Serial number (last 10 digits of device name)
-  BLECharacteristic *pSerial = pDeviceInfo->createCharacteristic("00002a25-0000-1000-8000-00805f9b34fb", BLECharacteristic::PROPERTY_READ);
+  BLECharacteristic *pSerial = pDeviceInfo->createCharacteristic(kSerialCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
   if (deviceName.length() >= 10) {
       pSerial->setValue(deviceName.substring(deviceName.length() - 10));
   } else {
       pSerial->setValue("0000000000");
   }
   // Firmware revision
-  BLECharacteristic *pFirm = pDeviceInfo->createCharacteristic("00002a26-0000-1000-8000-00805f9b34fb", BLECharacteristic::PROPERTY_READ);
-  pFirm->setValue("3.3");
+  BLECharacteristic *pFirm = pDeviceInfo->createCharacteristic(kFirmwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  pFirm->setValue(kFirmwareRevision);
   // Hardware revision
-  BLECharacteristic *pHardware = pDeviceInfo->createCharacteristic("00002a27-0000-1000-8000-00805f9b34fb", BLECharacteristic::PROPERTY_READ);
-  pHardware->setValue("1");
+  BLECharacteristic *pHardware = pDeviceInfo->createCharacteristic(kHardwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  pHardware->setValue(kHardwareRevision);
   // Manufacturer
-  BLECharacteristic *pManufacturer = pDeviceInfo->createCharacteristic("00002a29-0000-1000-8000-00805f9b34fb", BLECharacteristic::PROPERTY_READ);
-  pManufacturer->setValue("RaceBox");
+  BLECharacteristic *pManufacturer = pDeviceInfo->createCharacteristic(kManufacturerCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
+  pManufacturer->setValue(kManufacturerName);
   pDeviceInfo->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(RACEBOX_SERVICE_UUID);
+  pAdvertising->addServiceUUID(kRaceBoxServiceUuid);
   // Advertise Device Information Service to help official apps discover the device
-  pAdvertising->addServiceUUID("0000180a-0000-1000-8000-00805f9b34fb");
+  pAdvertising->addServiceUUID(kDeviceInfoServiceUuid);
   pAdvertising->setScanResponse(true);
   BLEDevice::startAdvertising();
   Serial.println("📡 BLE advertising started.");
@@ -335,8 +419,8 @@ void loop() {
   myGNSS.checkUblox(); // Required to keep GNSS data flowing
   static unsigned long lastAccelReadMs = 0;
   // Update Accelrometer readings at fixed interval
-  if (millis() - lastAccelReadMs >= AccelSampleInterval) {
-    lastAccelReadMs += AccelSampleInterval; // Strict timing grid
+  if (millis() - lastAccelReadMs >= kAccelSampleIntervalMs) {
+    lastAccelReadMs += kAccelSampleIntervalMs; // Strict timing grid
       lastAccelReadMs = millis();
       sensors_event_t a, g, temp;
       mpu.getEvent(&a, &g, &temp);
@@ -353,12 +437,12 @@ void loop() {
   // LED Blink Logic
   if (!deviceConnected) {
     static unsigned long lastBlinkMs = 0;
-    if (millis() - lastBlinkMs > 500) {
+    if (millis() - lastBlinkMs > kDisconnectedBlinkIntervalMs) {
       lastBlinkMs = millis();
-      digitalWrite(OnboardledPin, !digitalRead(OnboardledPin));
+      digitalWrite(kOnboardLedPin, !digitalRead(kOnboardLedPin));
     }
   } else {
-    digitalWrite(OnboardledPin, HIGH);
+    digitalWrite(kOnboardLedPin, HIGH);
   }
   if (myGNSS.getPVT()) {
     static uint32_t lastITOW = 0;
@@ -387,29 +471,29 @@ void loop() {
         uint8_t packet[88] = {0};
 
         // Access data directly from myGNSS.packetUBXNAVPVT->data
-        writeLittleEndian(payload, 0, myGNSS.packetUBXNAVPVT->data.iTOW);
-        writeLittleEndian(payload, 4, myGNSS.packetUBXNAVPVT->data.year);
-        writeLittleEndian(payload, 6, myGNSS.packetUBXNAVPVT->data.month);
-        writeLittleEndian(payload, 7, myGNSS.packetUBXNAVPVT->data.day);
-        writeLittleEndian(payload, 8, myGNSS.packetUBXNAVPVT->data.hour);
-        writeLittleEndian(payload, 9, myGNSS.packetUBXNAVPVT->data.min);
-        writeLittleEndian(payload, 10, myGNSS.packetUBXNAVPVT->data.sec);
+        writeLittleEndian(payload, kPayloadOffsetITow, myGNSS.packetUBXNAVPVT->data.iTOW);
+        writeLittleEndian(payload, kPayloadOffsetYear, myGNSS.packetUBXNAVPVT->data.year);
+        writeLittleEndian(payload, kPayloadOffsetMonth, myGNSS.packetUBXNAVPVT->data.month);
+        writeLittleEndian(payload, kPayloadOffsetDay, myGNSS.packetUBXNAVPVT->data.day);
+        writeLittleEndian(payload, kPayloadOffsetHour, myGNSS.packetUBXNAVPVT->data.hour);
+        writeLittleEndian(payload, kPayloadOffsetMinute, myGNSS.packetUBXNAVPVT->data.min);
+        writeLittleEndian(payload, kPayloadOffsetSecond, myGNSS.packetUBXNAVPVT->data.sec);
 
         // Offset 11: Validity Flags (RaceBox Protocol) 
         uint8_t raceboxValidityFlags = 0;
         if (myGNSS.packetUBXNAVPVT->data.valid.bits.validDate) raceboxValidityFlags |= (1 << 0); // Bit 0: valid date 
         if (myGNSS.packetUBXNAVPVT->data.valid.bits.validTime) raceboxValidityFlags |= (1 << 1); // Bit 1: valid time 
         if (myGNSS.packetUBXNAVPVT->data.valid.bits.fullyResolved) raceboxValidityFlags |= (1 << 2); // Bit 2: fully resolved 
-        writeLittleEndian(payload, 11, raceboxValidityFlags);
+        writeLittleEndian(payload, kPayloadOffsetValidityFlags, raceboxValidityFlags);
 
         // Offset 12: Time Accuracy (RaceBox Protocol) 
-        writeLittleEndian(payload, 12, myGNSS.packetUBXNAVPVT->data.tAcc);
+        writeLittleEndian(payload, kPayloadOffsetTimeAccuracy, myGNSS.packetUBXNAVPVT->data.tAcc);
 
         // Offset 16: Nanoseconds (RaceBox Protocol) 
-        writeLittleEndian(payload, 16, myGNSS.packetUBXNAVPVT->data.nano);
+        writeLittleEndian(payload, kPayloadOffsetNanoseconds, myGNSS.packetUBXNAVPVT->data.nano);
 
         // Offset 20: Fix Status (RaceBox Protocol) 
-        writeLittleEndian(payload, 20, myGNSS.packetUBXNAVPVT->data.fixType);
+        writeLittleEndian(payload, kPayloadOffsetFixType, myGNSS.packetUBXNAVPVT->data.fixType);
 
         // Offset 21: Fix Status Flags (RaceBox Protocol)
         uint8_t fixStatusFlagsRacebox = 0;
@@ -421,64 +505,64 @@ void loop() {
         if (myGNSS.getHeadVehValid()) { // Use the confirmed function to check for valid heading
             fixStatusFlagsRacebox |= (1 << 5); // Bit 5: valid heading (as per RaceBox Protocol)
         }
-        writeLittleEndian(payload, 21, fixStatusFlagsRacebox);
+        writeLittleEndian(payload, kPayloadOffsetFixStatusFlags, fixStatusFlagsRacebox);
 
         // Offset 22: Date/Time Flags (RaceBox Protocol) 
         uint8_t raceboxDateTimeFlags = 0;
         if (myGNSS.packetUBXNAVPVT->data.valid.bits.validTime) raceboxDateTimeFlags |= (1 << 5); // Available confirmation of Date/Time Validity
         if (myGNSS.packetUBXNAVPVT->data.valid.bits.validDate) raceboxDateTimeFlags |= (1 << 6); // Confirmed UTC Date Validity
         if (myGNSS.packetUBXNAVPVT->data.valid.bits.validTime && myGNSS.packetUBXNAVPVT->data.valid.bits.fullyResolved) raceboxDateTimeFlags |= (1 << 7); // Confirmed UTC Time Validity
-        writeLittleEndian(payload, 22, raceboxDateTimeFlags);
+        writeLittleEndian(payload, kPayloadOffsetDateTimeFlags, raceboxDateTimeFlags);
 
         // Offset 23: Number of SVs (RaceBox Protocol) 
-        writeLittleEndian(payload, 23, myGNSS.packetUBXNAVPVT->data.numSV);
+        writeLittleEndian(payload, kPayloadOffsetNumSv, myGNSS.packetUBXNAVPVT->data.numSV);
 
         // Remaining fields, mostly direct mappings from u-blox data
-        writeLittleEndian(payload, 24, myGNSS.packetUBXNAVPVT->data.lon);
-        writeLittleEndian(payload, 28, myGNSS.packetUBXNAVPVT->data.lat);
-        writeLittleEndian(payload, 32, myGNSS.packetUBXNAVPVT->data.height);
-        writeLittleEndian(payload, 36, myGNSS.packetUBXNAVPVT->data.hMSL);
+        writeLittleEndian(payload, kPayloadOffsetLongitude, myGNSS.packetUBXNAVPVT->data.lon);
+        writeLittleEndian(payload, kPayloadOffsetLatitude, myGNSS.packetUBXNAVPVT->data.lat);
+        writeLittleEndian(payload, kPayloadOffsetHeight, myGNSS.packetUBXNAVPVT->data.height);
+        writeLittleEndian(payload, kPayloadOffsetHmsl, myGNSS.packetUBXNAVPVT->data.hMSL);
 
-        writeLittleEndian(payload, 40, myGNSS.packetUBXNAVPVT->data.hAcc);
-        writeLittleEndian(payload, 44, myGNSS.packetUBXNAVPVT->data.vAcc);
-        writeLittleEndian(payload, 48, myGNSS.packetUBXNAVPVT->data.gSpeed);
-        writeLittleEndian(payload, 52, myGNSS.packetUBXNAVPVT->data.headMot);
-        writeLittleEndian(payload, 56, myGNSS.packetUBXNAVPVT->data.sAcc);
-        writeLittleEndian(payload, 60, myGNSS.packetUBXNAVPVT->data.headAcc);
+        writeLittleEndian(payload, kPayloadOffsetHorizontalAccuracy, myGNSS.packetUBXNAVPVT->data.hAcc);
+        writeLittleEndian(payload, kPayloadOffsetVerticalAccuracy, myGNSS.packetUBXNAVPVT->data.vAcc);
+        writeLittleEndian(payload, kPayloadOffsetGroundSpeed, myGNSS.packetUBXNAVPVT->data.gSpeed);
+        writeLittleEndian(payload, kPayloadOffsetHeadingOfMotion, myGNSS.packetUBXNAVPVT->data.headMot);
+        writeLittleEndian(payload, kPayloadOffsetSpeedAccuracy, myGNSS.packetUBXNAVPVT->data.sAcc);
+        writeLittleEndian(payload, kPayloadOffsetHeadingAccuracy, myGNSS.packetUBXNAVPVT->data.headAcc);
 
-        writeLittleEndian(payload, 64, myGNSS.packetUBXNAVPVT->data.pDOP);
+        writeLittleEndian(payload, kPayloadOffsetPdop, myGNSS.packetUBXNAVPVT->data.pDOP);
 
         // Offset 66: Lat/Lon Flags (RaceBox Protocol) 
         uint8_t latLonFlags = 0;
         if (myGNSS.packetUBXNAVPVT->data.fixType < 2) { // If no 2D/3D fix, then coordinates are considered invalid 
             latLonFlags |= (1 << 0); // Bit 0: Invalid Latitude, Longitude, WGS Altitude, and MSL Altitude
         }
-        writeLittleEndian(payload, 66, latLonFlags);
+        writeLittleEndian(payload, kPayloadOffsetLatLonFlags, latLonFlags);
 
         // Offset 67: Battery status (1 byte) - report 100% to avoid low battery warnings
-        writeLittleEndian(payload, 67, (uint8_t)100);
+        writeLittleEndian(payload, kPayloadOffsetBatteryStatus, kReportedBatteryPercent);
 
-        writeLittleEndian(payload, 68, gX);
-        writeLittleEndian(payload, 70, gY);
-        writeLittleEndian(payload, 72, gZ);
-        writeLittleEndian(payload, 74, rX);
-        writeLittleEndian(payload, 76, rY);
-        writeLittleEndian(payload, 78, rZ);
+        writeLittleEndian(payload, kPayloadOffsetAccelX, gX);
+        writeLittleEndian(payload, kPayloadOffsetAccelY, gY);
+        writeLittleEndian(payload, kPayloadOffsetAccelZ, gZ);
+        writeLittleEndian(payload, kPayloadOffsetGyroX, rX);
+        writeLittleEndian(payload, kPayloadOffsetGyroY, rY);
+        writeLittleEndian(payload, kPayloadOffsetGyroZ, rZ);
 
         // Wrap in UBX (standard RaceBox header and checksum)
-        packet[0] = 0xB5;
-        packet[1] = 0x62;
-        packet[2] = 0xFF; // Message Class: RaceBox Data Message 
-        packet[3] = 0x01; // Message ID: RaceBox Data Message 
-        packet[4] = 80;   // Payload size 
+        packet[0] = kUbxSyncChar1;
+        packet[1] = kUbxSyncChar2;
+        packet[2] = kRaceBoxMessageClass; // Message Class: RaceBox Data Message 
+        packet[3] = kRaceBoxMessageId; // Message ID: RaceBox Data Message 
+        packet[4] = kRaceBoxPayloadSize;   // Payload size 
         packet[5] = 0;
-        memcpy(packet + 6, payload, 80);
+        memcpy(packet + kPacketPayloadOffset, payload, kRaceBoxPayloadSize);
         uint8_t ckA, ckB; 
-        calculateChecksum(payload, 80, 0xFF, 0x01, &ckA, &ckB);
-        packet[86] = ckA;
-        packet[87] = ckB;
+        calculateChecksum(payload, kRaceBoxPayloadSize, kRaceBoxMessageClass, kRaceBoxMessageId, &ckA, &ckB);
+        packet[kPacketChecksumOffset] = ckA;
+        packet[kPacketChecksumOffset + 1] = ckB;
 
-        pCharacteristicTx->setValue(packet, 88);
+        pCharacteristicTx->setValue(packet, kRaceBoxPacketSize);
         pCharacteristicTx->notify();
         delay(5);
       }
@@ -486,9 +570,9 @@ void loop() {
 
     // Report packet send rate
     const unsigned long now = millis();
-    if ((now - lastGpsRateCheckTime) >= GPS_RATE_REPORT_INTERVAL_MS) {
-      float bleRate = gpsUpdateCount / (GPS_RATE_REPORT_INTERVAL_MS / 1000.0);
-      float gnssRate = gnssUpdateCount / (GPS_RATE_REPORT_INTERVAL_MS / 1000.0);
+    if ((now - lastGpsRateCheckTime) >= kGpsRateReportIntervalMs) {
+      float bleRate = gpsUpdateCount / (kGpsRateReportIntervalMs / 1000.0);
+      float gnssRate = gnssUpdateCount / (kGpsRateReportIntervalMs / 1000.0);
       // Additional satellite info for debugging: number of satellites, fix type, horizontal accuracy, and lat/lon
       uint8_t sats = 0;
       uint8_t fix = 0;
@@ -509,7 +593,7 @@ void loop() {
     }
 
     if (!deviceConnected && oldDeviceConnected) {
-      delay(500);
+      delay(kRestartAdvertisingDelayMs);
       pServer->startAdvertising();
       oldDeviceConnected = deviceConnected;
     }
