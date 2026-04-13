@@ -24,12 +24,20 @@ HardwareSerial GPS_Serial(2);
 // The specific constellations available and how many you can turn on depend on your u-blox module 
 // check this out for which constellations to enable https://app.qzss.go.jp/GNSSView/gnssview.html
 
-#define ENABLE_GNSS_GPS
-#define ENABLE_GNSS_GALILEO
-// #define ENABLE_GNSS_GLONASS
-// #define ENABLE_GNSS_BEIDOU
-// #define ENABLE_GNSS_SBAS
-// #define ENABLE_GNSS_QZSS
+struct GnssConstellationConfig {
+  sfe_ublox_gnss_ids_e id;
+  const char *name;
+  bool enabled;
+};
+
+constexpr GnssConstellationConfig kGnssConstellations[] = {
+  {SFE_UBLOX_GNSS_ID_GPS, "GPS", true},
+  {SFE_UBLOX_GNSS_ID_GALILEO, "Galileo", true},
+  {SFE_UBLOX_GNSS_ID_GLONASS, "GLONASS", false},
+  {SFE_UBLOX_GNSS_ID_BEIDOU, "BEIDOU", false},
+  {SFE_UBLOX_GNSS_ID_SBAS, "SBAS", false},
+  {SFE_UBLOX_GNSS_ID_QZSS, "QZSS", false},
+};
 
 constexpr char kDeviceName[] = "RaceBox Mini 0123456789";
 constexpr size_t kDeviceNamePrefixLength = sizeof("RaceBox Mini ") - 1U;
@@ -311,6 +319,24 @@ void initializeDeviceSerialNumber() {
   deviceSerialNumber[kDeviceNameSuffixLength] = '\0';
 }
 
+void configureGnssConstellations() {
+  for (size_t i = 0; i < (sizeof(kGnssConstellations) / sizeof(kGnssConstellations[0])); ++i) {
+    const GnssConstellationConfig &config = kGnssConstellations[i];
+    const bool configured = myGNSS.enableGNSS(config.enabled, config.id);
+
+    if (configured) {
+      Serial.print(config.enabled ? "✅ " : "🚫 ");
+      Serial.print(config.name);
+      Serial.println(config.enabled ? " enabled." : " disabled.");
+    } else {
+      Serial.print("❌ Failed to ");
+      Serial.print(config.enabled ? "enable " : "disable ");
+      Serial.print(config.name);
+      Serial.println(".");
+    }
+  }
+}
+
 void setup() {
   Serial.begin(kSerialBaudRate);
   pinMode(kOnboardLedPin, OUTPUT);
@@ -352,78 +378,7 @@ void setup() {
   }
 
   // --- GNSS Constellation Setup ---
-
-  // GPS
-  #ifdef ENABLE_GNSS_GPS
-    if (myGNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_GPS)) {
-      Serial.println("✅ GPS enabled.");
-    } else {
-      Serial.println("❌ Failed to enable GPS.");
-    }
-  #else
-    myGNSS.enableGNSS(false, SFE_UBLOX_GNSS_ID_GPS);
-    Serial.println("🚫 GPS disabled.");
-  #endif
-
-  // Galileo
-  #ifdef ENABLE_GNSS_GALILEO
-    if (myGNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_GALILEO)) {
-      Serial.println("✅ Galileo enabled.");
-    } else {
-      Serial.println("❌ Failed to enable Galileo.");
-    }
-  #else
-    myGNSS.enableGNSS(false, SFE_UBLOX_GNSS_ID_GALILEO);
-    Serial.println("🚫 Galileo disabled.");
-  #endif
-
-  // GLONASS
-  #ifdef ENABLE_GNSS_GLONASS
-    if (myGNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_GLONASS)) {
-      Serial.println("✅ GLONASS enabled.");
-    } else {
-      Serial.println("❌ Failed to enable GLONASS.");
-    }
-  #else
-    myGNSS.enableGNSS(false, SFE_UBLOX_GNSS_ID_GLONASS);
-    Serial.println("🚫 GLONASS disabled.");
-  #endif
-
-  // BeiDou
-  #ifdef ENABLE_GNSS_BEIDOU
-    if (myGNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_BEIDOU)) {
-      Serial.println("✅ BEIDOU enabled.");
-    } else {
-      Serial.println("❌ Failed to enable BEIDOU.");
-    }
-  #else
-    myGNSS.enableGNSS(false, SFE_UBLOX_GNSS_ID_BEIDOU);
-    Serial.println("🚫 BEIDOU disabled.");
-  #endif
-
-  // Optional: QZSS
-  #ifdef ENABLE_GNSS_QZSS
-    if (myGNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_QZSS)) {
-      Serial.println("✅ QZSS enabled.");
-    } else {
-      Serial.println("❌ Failed to enable QZSS.");
-    }
-  #else
-    myGNSS.enableGNSS(false, SFE_UBLOX_GNSS_ID_QZSS);
-    Serial.println("🚫 QZSS disabled.");
-  #endif
-
-  // Optional: SBAS (satellite-based augmentation)
-  #ifdef ENABLE_GNSS_SBAS
-    if (myGNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_SBAS)) {
-      Serial.println("✅ SBAS enabled.");
-    } else {
-      Serial.println("❌ Failed to enable SBAS.");
-    }
-  #else
-    myGNSS.enableGNSS(false, SFE_UBLOX_GNSS_ID_SBAS);
-    Serial.println("🚫 SBAS disabled.");
-  #endif
+  configureGnssConstellations();
 
   // --- BLE Setup ---
   BLEDevice::init(kDeviceName);
