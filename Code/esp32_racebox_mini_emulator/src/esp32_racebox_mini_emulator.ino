@@ -156,6 +156,16 @@ constexpr int kPayloadOffsetGyroY = 76;
 constexpr int kPayloadOffsetGyroZ = 78;
 constexpr uint8_t kReportedBatteryPercent = 100U;
 
+std::array<uint8_t, kRaceBoxPayloadSize> txPayloadBuffer = {};
+std::array<uint8_t, kRaceBoxPacketSize> txPacketBuffer = {{
+  kUbxSyncChar1,
+  kUbxSyncChar2,
+  kRaceBoxMessageClass,
+  kRaceBoxMessageId,
+  static_cast<uint8_t>(kRaceBoxPayloadSize),
+  0U
+}};
+
 static_assert(kRaceBoxPacketSize == (kRaceBoxHeaderSize + kRaceBoxPayloadSize + kRaceBoxChecksumSize),
               "RaceBox packet size must match header + payload + checksum.");
 static_assert(kPacketChecksumOffset + static_cast<int>(kRaceBoxChecksumSize) == static_cast<int>(kRaceBoxPacketSize),
@@ -469,8 +479,8 @@ void loop() {
         int16_t rY = filtered_gy * 180.0 / M_PI * 100.0;
         int16_t rZ = filtered_gz * 180.0 / M_PI * 100.0;
 
-        uint8_t payload[80] = {0};
-        uint8_t packet[88] = {0};
+        uint8_t *payload = txPayloadBuffer.data();
+        uint8_t *packet = txPacketBuffer.data();
 
         // Access data directly from myGNSS.packetUBXNAVPVT->data
         writeLittleEndian(payload, kPayloadOffsetITow, myGNSS.packetUBXNAVPVT->data.iTOW);
@@ -552,12 +562,6 @@ void loop() {
         writeLittleEndian(payload, kPayloadOffsetGyroZ, rZ);
 
         // Wrap in UBX (standard RaceBox header and checksum)
-        packet[0] = kUbxSyncChar1;
-        packet[1] = kUbxSyncChar2;
-        packet[2] = kRaceBoxMessageClass; // Message Class: RaceBox Data Message 
-        packet[3] = kRaceBoxMessageId; // Message ID: RaceBox Data Message 
-        packet[4] = kRaceBoxPayloadSize;   // Payload size 
-        packet[5] = 0;
         memcpy(packet + kPacketPayloadOffset, payload, kRaceBoxPayloadSize);
         uint8_t ckA, ckB; 
         calculateChecksum(payload, kRaceBoxPayloadSize, kRaceBoxMessageClass, kRaceBoxMessageId, &ckA, &ckB);
