@@ -8,7 +8,6 @@
 #include <BLE2902.h>
 #include <array>
 #include <cstring>
-#include <string>
 
 // --- GPS Configuration ---
 constexpr uint32_t kSerialBaudRate = 115200UL;
@@ -62,7 +61,7 @@ static_assert(deviceNameSuffixIsDigits(kDeviceName, kDeviceNamePrefixLength, kDe
 static_assert(parseDeviceNameSuffix(kDeviceName, kDeviceNamePrefixLength, kDeviceNameSuffixLength) <= kMaxAllowedDeviceSuffix,
               "RaceBox Mini number cannot exceed 3999999999 for compatibility with the official RaceBox app.");
 
-const String deviceName = kDeviceName;
+char deviceSerialNumber[kDeviceNameSuffixLength + 1U] = {};
 
 constexpr int kOnboardLedPin = 2;
 
@@ -183,12 +182,13 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
 class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
-    String rxValue = pCharacteristic->getValue(); 
-    
-    if (rxValue.length() > 0) {
+    uint8_t *rxValue = pCharacteristic->getData();
+    const size_t rxLength = pCharacteristic->getLength();
+
+    if (rxLength > 0U) {
       Serial.print("📨 Received BLE command: ");
-      for (size_t i = 0; i < rxValue.length(); i++) {
-        Serial.printf("0x%02X ", (uint8_t)rxValue[i]);
+      for (size_t i = 0; i < rxLength; ++i) {
+        Serial.printf("0x%02X ", rxValue[i]);
       }
       Serial.println();
     }
@@ -261,9 +261,15 @@ void resetGpsBaudRate() {
   GPS_Serial.end();
 }
 
+void initializeDeviceSerialNumber() {
+  memcpy(deviceSerialNumber, kDeviceName + kDeviceNamePrefixLength, kDeviceNameSuffixLength);
+  deviceSerialNumber[kDeviceNameSuffixLength] = '\0';
+}
+
 void setup() {
   Serial.begin(kSerialBaudRate);
   pinMode(kOnboardLedPin, OUTPUT);
+  initializeDeviceSerialNumber();
   if (!mpu.begin()) {
     Serial.println("❌ Failed to find MPU6050 chip");
     while (1) delay(100);
@@ -372,7 +378,7 @@ void setup() {
   #endif
 
   // --- BLE Setup ---
-  BLEDevice::init(deviceName.c_str());
+  BLEDevice::init(kDeviceName);
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
@@ -389,11 +395,7 @@ void setup() {
   pModel->setValue(kModelName);
   // Serial number (last 10 digits of device name)
   BLECharacteristic *pSerial = pDeviceInfo->createCharacteristic(kSerialCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
-  if (deviceName.length() >= 10) {
-      pSerial->setValue(deviceName.substring(deviceName.length() - 10));
-  } else {
-      pSerial->setValue("0000000000");
-  }
+  pSerial->setValue(reinterpret_cast<uint8_t*>(deviceSerialNumber), kDeviceNameSuffixLength);
   // Firmware revision
   BLECharacteristic *pFirm = pDeviceInfo->createCharacteristic(kFirmwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ);
   pFirm->setValue(kFirmwareRevision);
