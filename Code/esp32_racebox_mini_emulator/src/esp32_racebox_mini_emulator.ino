@@ -246,9 +246,9 @@ int16_t saturatingFloatToInt16(float value) {
   return static_cast<int16_t>(value);
 }
 
-void resetGpsBaudRate() {
+bool resetGpsBaudRate() {
   Serial.println("Attempting to set Correct Baud Rate");
-  GPS_Serial.begin(kFactoryGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+  GPS_Serial.updateBaudRate(kFactoryGpsBaudRate);
   delay(500);
 
   if (!myGNSS.begin(GPS_Serial)) {
@@ -256,7 +256,7 @@ void resetGpsBaudRate() {
     Serial.print(kFactoryGpsBaudRate);
     Serial.println(" baud.");
     Serial.print("u-blox GNSS not detected, Check documentation for factory baud rate and/or check your wiring");
-    while(1) delay(100);
+    return false;
   } else {
     Serial.print("GNSS detected at ");
     Serial.print(kFactoryGpsBaudRate);
@@ -272,10 +272,7 @@ void resetGpsBaudRate() {
   Serial.print("Baud rate changed to ");
   Serial.println(kGpsBaudRate);
 
-  GPS_Serial.end();
-  delay(100);
-  // Re-initialize the serial port at the new baud rate
-  GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+  GPS_Serial.updateBaudRate(kGpsBaudRate);
   delay(500);
 
   if (!myGNSS.begin(GPS_Serial)) {
@@ -283,13 +280,13 @@ void resetGpsBaudRate() {
     Serial.print(kGpsBaudRate);
     Serial.println(" baud.");
     Serial.print("u-blox GNSS not detected, Check documentation for factory baud rate and/or check your wiring");
-    while (1) delay(100);
+    return false;
   }
   Serial.print("GNSS detected at ");
   Serial.print(kGpsBaudRate);
   Serial.println(" baud! Saving to Flash");
   myGNSS.saveConfiguration(); // Save to flash
-  GPS_Serial.end();
+  return true;
 }
 
 void validateDeviceNameOrHalt() {
@@ -363,12 +360,15 @@ void setup() {
   filtered_gy = g.gyro.y;
   filtered_gz = g.gyro.z;
 
+  GPS_Serial.setRxBufferSize(512);
   GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   if (!myGNSS.begin(GPS_Serial)) {
     Serial.println("❌ GNSS not detected. Attempting to configure.");
-    GPS_Serial.end();
-    resetGpsBaudRate();
-    GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+    if (!resetGpsBaudRate()) {
+      while (1) {
+        delay(100);
+      }
+    }
   }
 
   // Set GNSS output to PVT only
