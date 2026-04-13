@@ -155,6 +155,10 @@ constexpr int kPayloadOffsetGyroX = 74;
 constexpr int kPayloadOffsetGyroY = 76;
 constexpr int kPayloadOffsetGyroZ = 78;
 constexpr uint8_t kReportedBatteryPercent = 100U;
+constexpr float kAccelerationToMilliG = 1000.0f / 9.80665f;
+constexpr float kGyroRadiansToCentiDegrees = 18000.0f / static_cast<float>(M_PI);
+constexpr float kGpsRateReportIntervalSeconds = kGpsRateReportIntervalMs / 1000.0f;
+constexpr double kLatLonToDegrees = 1e-7;
 
 std::array<uint8_t, kRaceBoxPayloadSize> txPayloadBuffer = {};
 std::array<uint8_t, kRaceBoxPacketSize> txPacketBuffer = {{
@@ -312,6 +316,9 @@ void setup() {
   filtered_ax = a.acceleration.x;
   filtered_ay = a.acceleration.y;
   filtered_az = a.acceleration.z;
+  filtered_gx = g.gyro.x;
+  filtered_gy = g.gyro.y;
+  filtered_gz = g.gyro.z;
 
   GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   if (!myGNSS.begin(GPS_Serial)) {
@@ -500,49 +507,50 @@ void loop() {
       if (deviceConnected && (pCharacteristicTx != NULL)) {
         lastPacketSendTime = now;
         gpsUpdateCount++;
+        const auto &navData = navPvtPacket->data;
 
         // Convert accelerometer to milli-g (1g = 9.80665 m/s^2)
-        int16_t gX = filtered_ax * 1000.0 / 9.80665;
-        int16_t gY = filtered_ay * 1000.0 / 9.80665;
-        int16_t gZ = filtered_az * 1000.0 / 9.80665;
+        const int16_t gX = filtered_ax * kAccelerationToMilliG;
+        const int16_t gY = filtered_ay * kAccelerationToMilliG;
+        const int16_t gZ = filtered_az * kAccelerationToMilliG;
 
         // Convert gyro to centi-deg/sec
-        int16_t rX = filtered_gx * 180.0 / M_PI * 100.0;
-        int16_t rY = filtered_gy * 180.0 / M_PI * 100.0;
-        int16_t rZ = filtered_gz * 180.0 / M_PI * 100.0;
+        const int16_t rX = filtered_gx * kGyroRadiansToCentiDegrees;
+        const int16_t rY = filtered_gy * kGyroRadiansToCentiDegrees;
+        const int16_t rZ = filtered_gz * kGyroRadiansToCentiDegrees;
 
         uint8_t *payload = txPayloadBuffer.data();
         uint8_t *packet = txPacketBuffer.data();
 
-        // Access data directly from navPvtPacket->data
-        writeLittleEndian(payload, kPayloadOffsetITow, navPvtPacket->data.iTOW);
-        writeLittleEndian(payload, kPayloadOffsetYear, navPvtPacket->data.year);
-        writeLittleEndian(payload, kPayloadOffsetMonth, navPvtPacket->data.month);
-        writeLittleEndian(payload, kPayloadOffsetDay, navPvtPacket->data.day);
-        writeLittleEndian(payload, kPayloadOffsetHour, navPvtPacket->data.hour);
-        writeLittleEndian(payload, kPayloadOffsetMinute, navPvtPacket->data.min);
-        writeLittleEndian(payload, kPayloadOffsetSecond, navPvtPacket->data.sec);
+        // Access data directly from navData
+        writeLittleEndian(payload, kPayloadOffsetITow, navData.iTOW);
+        writeLittleEndian(payload, kPayloadOffsetYear, navData.year);
+        writeLittleEndian(payload, kPayloadOffsetMonth, navData.month);
+        writeLittleEndian(payload, kPayloadOffsetDay, navData.day);
+        writeLittleEndian(payload, kPayloadOffsetHour, navData.hour);
+        writeLittleEndian(payload, kPayloadOffsetMinute, navData.min);
+        writeLittleEndian(payload, kPayloadOffsetSecond, navData.sec);
 
         // Offset 11: Validity Flags (RaceBox Protocol) 
         uint8_t raceboxValidityFlags = 0;
-        if (navPvtPacket->data.valid.bits.validDate) raceboxValidityFlags |= (1 << 0); // Bit 0: valid date 
-        if (navPvtPacket->data.valid.bits.validTime) raceboxValidityFlags |= (1 << 1); // Bit 1: valid time 
-        if (navPvtPacket->data.valid.bits.fullyResolved) raceboxValidityFlags |= (1 << 2); // Bit 2: fully resolved 
+        if (navData.valid.bits.validDate) raceboxValidityFlags |= (1 << 0); // Bit 0: valid date 
+        if (navData.valid.bits.validTime) raceboxValidityFlags |= (1 << 1); // Bit 1: valid time 
+        if (navData.valid.bits.fullyResolved) raceboxValidityFlags |= (1 << 2); // Bit 2: fully resolved 
         writeLittleEndian(payload, kPayloadOffsetValidityFlags, raceboxValidityFlags);
 
         // Offset 12: Time Accuracy (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetTimeAccuracy, navPvtPacket->data.tAcc);
+        writeLittleEndian(payload, kPayloadOffsetTimeAccuracy, navData.tAcc);
 
         // Offset 16: Nanoseconds (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetNanoseconds, navPvtPacket->data.nano);
+        writeLittleEndian(payload, kPayloadOffsetNanoseconds, navData.nano);
 
         // Offset 20: Fix Status (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetFixType, navPvtPacket->data.fixType);
+        writeLittleEndian(payload, kPayloadOffsetFixType, navData.fixType);
 
         // Offset 21: Fix Status Flags (RaceBox Protocol)
         uint8_t fixStatusFlagsRacebox = 0;
 
-        if (navPvtPacket->data.fixType == 3) {
+        if (navData.fixType == 3) {
             fixStatusFlagsRacebox |= (1 << 0); // Bit 0: valid fix
         }
 
@@ -553,32 +561,32 @@ void loop() {
 
         // Offset 22: Date/Time Flags (RaceBox Protocol) 
         uint8_t raceboxDateTimeFlags = 0;
-        if (navPvtPacket->data.valid.bits.validTime) raceboxDateTimeFlags |= (1 << 5); // Available confirmation of Date/Time Validity
-        if (navPvtPacket->data.valid.bits.validDate) raceboxDateTimeFlags |= (1 << 6); // Confirmed UTC Date Validity
-        if (navPvtPacket->data.valid.bits.validTime && navPvtPacket->data.valid.bits.fullyResolved) raceboxDateTimeFlags |= (1 << 7); // Confirmed UTC Time Validity
+        if (navData.valid.bits.validTime) raceboxDateTimeFlags |= (1 << 5); // Available confirmation of Date/Time Validity
+        if (navData.valid.bits.validDate) raceboxDateTimeFlags |= (1 << 6); // Confirmed UTC Date Validity
+        if (navData.valid.bits.validTime && navData.valid.bits.fullyResolved) raceboxDateTimeFlags |= (1 << 7); // Confirmed UTC Time Validity
         writeLittleEndian(payload, kPayloadOffsetDateTimeFlags, raceboxDateTimeFlags);
 
         // Offset 23: Number of SVs (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetNumSv, navPvtPacket->data.numSV);
+        writeLittleEndian(payload, kPayloadOffsetNumSv, navData.numSV);
 
         // Remaining fields, mostly direct mappings from u-blox data
-        writeLittleEndian(payload, kPayloadOffsetLongitude, navPvtPacket->data.lon);
-        writeLittleEndian(payload, kPayloadOffsetLatitude, navPvtPacket->data.lat);
-        writeLittleEndian(payload, kPayloadOffsetHeight, navPvtPacket->data.height);
-        writeLittleEndian(payload, kPayloadOffsetHmsl, navPvtPacket->data.hMSL);
+        writeLittleEndian(payload, kPayloadOffsetLongitude, navData.lon);
+        writeLittleEndian(payload, kPayloadOffsetLatitude, navData.lat);
+        writeLittleEndian(payload, kPayloadOffsetHeight, navData.height);
+        writeLittleEndian(payload, kPayloadOffsetHmsl, navData.hMSL);
 
-        writeLittleEndian(payload, kPayloadOffsetHorizontalAccuracy, navPvtPacket->data.hAcc);
-        writeLittleEndian(payload, kPayloadOffsetVerticalAccuracy, navPvtPacket->data.vAcc);
-        writeLittleEndian(payload, kPayloadOffsetGroundSpeed, navPvtPacket->data.gSpeed);
-        writeLittleEndian(payload, kPayloadOffsetHeadingOfMotion, navPvtPacket->data.headMot);
-        writeLittleEndian(payload, kPayloadOffsetSpeedAccuracy, navPvtPacket->data.sAcc);
-        writeLittleEndian(payload, kPayloadOffsetHeadingAccuracy, navPvtPacket->data.headAcc);
+        writeLittleEndian(payload, kPayloadOffsetHorizontalAccuracy, navData.hAcc);
+        writeLittleEndian(payload, kPayloadOffsetVerticalAccuracy, navData.vAcc);
+        writeLittleEndian(payload, kPayloadOffsetGroundSpeed, navData.gSpeed);
+        writeLittleEndian(payload, kPayloadOffsetHeadingOfMotion, navData.headMot);
+        writeLittleEndian(payload, kPayloadOffsetSpeedAccuracy, navData.sAcc);
+        writeLittleEndian(payload, kPayloadOffsetHeadingAccuracy, navData.headAcc);
 
-        writeLittleEndian(payload, kPayloadOffsetPdop, navPvtPacket->data.pDOP);
+        writeLittleEndian(payload, kPayloadOffsetPdop, navData.pDOP);
 
         // Offset 66: Lat/Lon Flags (RaceBox Protocol) 
         uint8_t latLonFlags = 0;
-        if (navPvtPacket->data.fixType < 2) { // If no 2D/3D fix, then coordinates are considered invalid 
+        if (navData.fixType < 2) { // If no 2D/3D fix, then coordinates are considered invalid 
             latLonFlags |= (1 << 0); // Bit 0: Invalid Latitude, Longitude, WGS Altitude, and MSL Altitude
         }
         writeLittleEndian(payload, kPayloadOffsetLatLonFlags, latLonFlags);
@@ -608,19 +616,20 @@ void loop() {
 
     // Report packet send rate
     if ((now - lastGpsRateCheckTime) >= kGpsRateReportIntervalMs) {
-      float bleRate = gpsUpdateCount / (kGpsRateReportIntervalMs / 1000.0);
-      float gnssRate = gnssUpdateCount / (kGpsRateReportIntervalMs / 1000.0);
+      const float bleRate = gpsUpdateCount / kGpsRateReportIntervalSeconds;
+      const float gnssRate = gnssUpdateCount / kGpsRateReportIntervalSeconds;
       // Additional satellite info for debugging: number of satellites, fix type, horizontal accuracy, and lat/lon
       uint8_t sats = 0;
       uint8_t fix = 0;
       uint32_t hAcc = 0;
       double lat = 0.0, lon = 0.0;
       if (navPvtPacket != NULL) {
-        sats = navPvtPacket->data.numSV;
-        fix = navPvtPacket->data.fixType;
-        hAcc = navPvtPacket->data.hAcc;
-        lat = navPvtPacket->data.lat * 1e-7;
-        lon = navPvtPacket->data.lon * 1e-7;
+        const auto &navData = navPvtPacket->data;
+        sats = navData.numSV;
+        fix = navData.fixType;
+        hAcc = navData.hAcc;
+        lat = navData.lat * kLatLonToDegrees;
+        lon = navData.lon * kLatLonToDegrees;
       }
       Serial.printf("BLE Packet Rate: %.2f Hz | GNSS Update Rate: %.2f Hz | SVs: %u | Fix: %u | HAcc: %u mm | Lat: %.7f Lon: %.7f\n",
                     bleRate, gnssRate, sats, fix, hAcc, lat, lon);
