@@ -7,6 +7,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -44,31 +45,8 @@ constexpr size_t kDeviceNamePrefixLength = sizeof("RaceBox Mini ") - 1U;
 constexpr size_t kDeviceNameSuffixLength = 10U;
 constexpr unsigned long kMaxAllowedDeviceSuffix = 3999999999UL;
 
-constexpr bool isDigit(char value) {
-  return (value >= '0') && (value <= '9');
-}
-
-constexpr unsigned long pow10(unsigned int exponent) {
-  return (exponent == 0U) ? 1UL : 10UL * pow10(exponent - 1U);
-}
-
-constexpr bool deviceNameSuffixIsDigits(const char* name, unsigned int index, unsigned int remaining) {
-  return (remaining == 0U) ? true : (isDigit(name[index]) && deviceNameSuffixIsDigits(name, index + 1U, remaining - 1U));
-}
-
-constexpr unsigned long parseDeviceNameSuffix(const char* name, unsigned int index, unsigned int remaining) {
-  return (remaining == 0U)
-             ? 0UL
-             : (static_cast<unsigned long>(name[index] - '0') * pow10(remaining - 1U)) +
-                   parseDeviceNameSuffix(name, index + 1U, remaining - 1U);
-}
-
 static_assert(sizeof(kDeviceName) == (kDeviceNamePrefixLength + kDeviceNameSuffixLength + 1U),
               "Device name must be 'RaceBox Mini ' followed by 10 digits.");
-static_assert(deviceNameSuffixIsDigits(kDeviceName, kDeviceNamePrefixLength, kDeviceNameSuffixLength),
-              "Device name suffix must contain digits only.");
-static_assert(parseDeviceNameSuffix(kDeviceName, kDeviceNamePrefixLength, kDeviceNameSuffixLength) <= kMaxAllowedDeviceSuffix,
-              "RaceBox Mini number cannot exceed 3999999999 for compatibility with the official RaceBox app.");
 
 char deviceSerialNumber[kDeviceNameSuffixLength + 1U] = {};
 
@@ -314,8 +292,34 @@ void resetGpsBaudRate() {
   GPS_Serial.end();
 }
 
-void initializeDeviceSerialNumber() {
-  memcpy(deviceSerialNumber, kDeviceName + kDeviceNamePrefixLength, kDeviceNameSuffixLength);
+void validateDeviceNameOrHalt() {
+  const char *suffix = kDeviceName + kDeviceNamePrefixLength;
+
+  if (strncmp(kDeviceName, "RaceBox Mini ", kDeviceNamePrefixLength) != 0) {
+    Serial.println("❌ Device name must start with 'RaceBox Mini '.");
+    while (1) {
+      delay(100);
+    }
+  }
+
+  if (strspn(suffix, "0123456789") != kDeviceNameSuffixLength) {
+    Serial.println("❌ Device name suffix must contain exactly 10 digits.");
+    while (1) {
+      delay(100);
+    }
+  }
+
+  char *parsedEnd = NULL;
+  const unsigned long suffixValue = strtoul(suffix, &parsedEnd, 10);
+
+  if ((parsedEnd == NULL) || (*parsedEnd != '\0') || (suffixValue > kMaxAllowedDeviceSuffix)) {
+    Serial.println("❌ RaceBox Mini number must be 3999999999 or lower.");
+    while (1) {
+      delay(100);
+    }
+  }
+
+  memcpy(deviceSerialNumber, suffix, kDeviceNameSuffixLength);
   deviceSerialNumber[kDeviceNameSuffixLength] = '\0';
 }
 
@@ -340,7 +344,7 @@ void configureGnssConstellations() {
 void setup() {
   Serial.begin(kSerialBaudRate);
   pinMode(kOnboardLedPin, OUTPUT);
-  initializeDeviceSerialNumber();
+  validateDeviceNameOrHalt();
   if (!mpu.begin()) {
     Serial.println("❌ Failed to find MPU6050 chip");
     while (1) delay(100);
