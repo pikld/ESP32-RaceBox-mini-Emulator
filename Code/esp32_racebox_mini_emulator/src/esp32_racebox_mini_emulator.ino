@@ -629,7 +629,6 @@ void loop() {
 
         pCharacteristicTx->setValue(packet, kRaceBoxPacketSize);
         pCharacteristicTx->notify();
-        delay(5);
       }
     }
 
