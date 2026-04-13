@@ -246,6 +246,15 @@ int16_t saturatingFloatToInt16(float value) {
   return static_cast<int16_t>(value);
 }
 
+bool configureGnssUartOutput() {
+  if (myGNSS.setUART1Output(COM_TYPE_UBX)) {
+    return true;
+  }
+
+  Serial.println("❌ Failed to set GNSS UART output to UBX only.");
+  return false;
+}
+
 bool resetGpsBaudRate() {
   Serial.println("Attempting to set Correct Baud Rate");
   GPS_Serial.updateBaudRate(kFactoryGpsBaudRate);
@@ -284,8 +293,11 @@ bool resetGpsBaudRate() {
   }
   Serial.print("GNSS detected at ");
   Serial.print(kGpsBaudRate);
-  Serial.println(" baud! Saving to Flash");
-  myGNSS.saveConfiguration(); // Save to flash
+  Serial.println(" baud! Saving I/O port settings to Flash");
+  if (!configureGnssUartOutput()) {
+    return false;
+  }
+  myGNSS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);
   return true;
 }
 
@@ -372,6 +384,7 @@ void setup() {
   }
 
   // Set GNSS output to PVT only
+  configureGnssUartOutput();
   myGNSS.setAutoPVT(true);
   myGNSS.setDynamicModel(DYN_MODEL_AUTOMOTIVE);
     // --- Configure GPS update rate to kMaxNavigationRateHz Hz ---
