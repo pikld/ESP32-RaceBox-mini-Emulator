@@ -14,8 +14,10 @@
 
 // (DO NOT CHANGE THESE: Required for RaceBox Application compatibility)
 #define DEVICE_NAME "RaceBox Mini " SERIAL_NUM // Auto-synced Name
+#define DEVICE_MODEL "RaceBox Mini"
 #define MANUFACTURER "RaceBox"
 #define FIRMWARE_VER "3.3"
+#define HARDWARE_VER "1"
 
 // --- GPS Performance ---
 #define MAX_NAVIGATION_RATE 25 // 25Hz: Max rate for RaceBox Mini protocol
@@ -105,14 +107,20 @@ const uint8_t RACEBOX_TX_UUID[] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5,
 const uint8_t RACEBOX_RX_UUID[] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5,
                                    0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5,
                                    0x02, 0x00, 0x40, 0x6E};
-const uint8_t RACEBOX_GNSS_UUID[] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5,
-                                     0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5,
-                                     0x04, 0x00, 0x40, 0x6E};
+const uint8_t NMEA_SERVICE_UUID[] = {0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00,
+                                     0x00, 0x80, 0x00, 0x10, 0x00, 0x00,
+                                     0x01, 0x11, 0x00, 0x00};
+const uint8_t NMEA_RX_UUID[] = {0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
+                                0x00, 0x10, 0x00, 0x00, 0x02, 0x11, 0x00, 0x00};
+const uint8_t NMEA_TX_UUID[] = {0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
+                                0x00, 0x10, 0x00, 0x00, 0x03, 0x11, 0x00, 0x00};
 
 BLEService rbService(RACEBOX_SERVICE_UUID);
 BLECharacteristic rbTx(RACEBOX_TX_UUID);
 BLECharacteristic rbRx(RACEBOX_RX_UUID);
-BLECharacteristic rbGnss(RACEBOX_GNSS_UUID);
+BLEService nmeaService(NMEA_SERVICE_UUID);
+BLECharacteristic nmeaTx(NMEA_TX_UUID);
+BLECharacteristic nmeaRx(NMEA_RX_UUID);
 
 BLEService disService(UUID16_SVC_DEVICE_INFORMATION);
 BLECharacteristic disModel(UUID16_CHR_MODEL_NUMBER_STRING);
@@ -581,6 +589,7 @@ void setupAdvertising(int8_t power, uint16_t interval) {
   // NOTE: We keep the Service UUIDs in the primary advertisement for
   // compatibility with the RaceBox application.
   Bluefruit.Advertising.addService(rbService);
+  Bluefruit.Advertising.addService(nmeaService);
   Bluefruit.Advertising.addService(disService);
 
   // Scan Response only contains the Name to keep it simple
@@ -879,6 +888,14 @@ void write_callback(uint16_t conn_handle, BLECharacteristic *chr, uint8_t *data,
   Serial.println();
 }
 
+void nmea_write_callback(uint16_t conn_handle, BLECharacteristic *chr,
+                         uint8_t *data, uint16_t len) {
+  (void)conn_handle;
+  (void)chr;
+  (void)data;
+  (void)len;
+}
+
 void setIMUForSleep() {
   IMU.settings.gyroEnabled = 0;
   IMU.settings.accelEnabled = 0;
@@ -983,13 +1000,16 @@ void setupBLE() {
   disService.begin();
   disModel.setProperties(CHR_PROPS_READ);
   disModel.begin();
-  disModel.write(DEVICE_NAME);
+  disModel.write(DEVICE_MODEL);
   disSerial.setProperties(CHR_PROPS_READ);
   disSerial.begin();
   disSerial.write(SERIAL_NUM);
   disFirmware.setProperties(CHR_PROPS_READ);
   disFirmware.begin();
   disFirmware.write(FIRMWARE_VER);
+  disHardware.setProperties(CHR_PROPS_READ);
+  disHardware.begin();
+  disHardware.write(HARDWARE_VER);
   disManuf.setProperties(CHR_PROPS_READ);
   disManuf.begin();
   disManuf.write(MANUFACTURER);
@@ -1005,8 +1025,16 @@ void setupBLE() {
   rbRx.setWriteCallback(write_callback);
   rbRx.begin();
 
-  rbGnss.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
-  rbGnss.begin();
+  nmeaService.begin();
+  nmeaTx.setProperties(CHR_PROPS_NOTIFY);
+  nmeaTx.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  nmeaTx.setFixedLen(82);
+  nmeaTx.begin();
+
+  nmeaRx.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  nmeaRx.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  nmeaRx.setWriteCallback(nmea_write_callback);
+  nmeaRx.begin();
 }
 
 void setup() {

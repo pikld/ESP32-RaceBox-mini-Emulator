@@ -7,31 +7,41 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 
-// --- GPS Configuration ---
+// ============================================================================
+// User Settings
+// Change values in this section when adapting the sketch to different hardware
+// or tuning behavior. Everything below is implementation detail or protocol
+// layout and should usually stay unchanged.
+// ============================================================================
+namespace UserSettings {
+
 constexpr uint32_t kSerialBaudRate = 115200UL;
-constexpr int kGpsRxPin = 16;
-constexpr int kGpsTxPin = 17;
-constexpr uint32_t kGpsBaudRate = 115200UL;
-constexpr uint32_t kFactoryGpsBaudRate = 9600UL;
-constexpr uint8_t kMaxNavigationRateHz = 25U;
 
-SFE_UBLOX_GNSS myGNSS;
-HardwareSerial GPS_Serial(2);
-// --- Enable GNSS constellations ---
-// The specific constellations available and how many you can turn on depend on your u-blox module 
-// check this out for which constellations to enable https://app.qzss.go.jp/GNSSView/gnssview.html
+namespace Device {
+constexpr char kName[] = "RaceBox Mini 0123456789";
+constexpr int kStatusLedPin = 2;
+}  // namespace Device
 
-struct GnssConstellationConfig {
+namespace Gnss {
+constexpr int kRxPin = 16;
+constexpr int kTxPin = 17;
+constexpr uint32_t kBaudRate = 115200UL;
+constexpr uint32_t kFactoryBaudRate = 9600UL;
+constexpr uint8_t kNavigationRateHz = 25U;
+
+struct ConstellationSetting {
   sfe_ublox_gnss_ids_e id;
   const char *name;
   bool enabled;
 };
 
-constexpr GnssConstellationConfig kGnssConstellations[] = {
+// Available constellations depend on the installed u-blox receiver.
+constexpr ConstellationSetting kConstellations[] = {
   {SFE_UBLOX_GNSS_ID_GPS, "GPS", true},
   {SFE_UBLOX_GNSS_ID_GALILEO, "Galileo", true},
   {SFE_UBLOX_GNSS_ID_GLONASS, "GLONASS", false},
@@ -39,199 +49,320 @@ constexpr GnssConstellationConfig kGnssConstellations[] = {
   {SFE_UBLOX_GNSS_ID_SBAS, "SBAS", false},
   {SFE_UBLOX_GNSS_ID_QZSS, "QZSS", false},
 };
+}  // namespace Gnss
 
-constexpr char kDeviceName[] = "RaceBox Mini 0123456789";
-constexpr size_t kDeviceNamePrefixLength = sizeof("RaceBox Mini ") - 1U;
-constexpr size_t kDeviceNameSuffixLength = 10U;
-constexpr unsigned long kMaxAllowedDeviceSuffix = 3999999999UL;
+namespace Imu {
+constexpr uint32_t kSampleIntervalMs = 10UL;  // 100 Hz
+constexpr float kAccelFilterAlpha = 0.8f;
+constexpr float kGyroFilterAlpha = 0.8f;
+constexpr mpu6050_accel_range_t kAccelRange = MPU6050_RANGE_8_G;
+constexpr mpu6050_gyro_range_t kGyroRange = MPU6050_RANGE_500_DEG;
+constexpr mpu6050_bandwidth_t kFilterBandwidth = MPU6050_BAND_21_HZ;
+}  // namespace Imu
 
-static_assert(sizeof(kDeviceName) == (kDeviceNamePrefixLength + kDeviceNameSuffixLength + 1U),
-              "Device name must be 'RaceBox Mini ' followed by 10 digits.");
+namespace Ble {
+constexpr uint16_t kRequestedMtu = 128U;
+}  // namespace Ble
 
-char deviceSerialNumber[kDeviceNameSuffixLength + 1U] = {};
+}  // namespace UserSettings
 
-constexpr int kOnboardLedPin = 2;
+// ============================================================================
+// Fixed Constants
+// Protocol layout, timing, device identity metadata, and conversion factors.
+// These are not day-to-day user settings.
+// ============================================================================
+namespace InternalConstants {
 
-Adafruit_MPU6050 mpu;
-constexpr uint32_t kAccelSampleIntervalMs = 10UL; // 10ms = 100Hz
-// --- Smoothing Configuration ---
-// alpha = 1.0: No filtering (raw data)
-// alpha = 0.5: 50% current reading, 50% previous (moderate)
-// alpha = 0.8: Very snappy, just kills high-frequency "buzz"
-float accelAlpha = 0.8; 
-float gyroAlpha = 0.8; 
-// Storage for the filtered values
-float filtered_ax = 0, filtered_ay = 0, filtered_az = 0;
-float filtered_gx = 0, filtered_gy = 0, filtered_gz = 0;
+namespace DeviceIdentity {
+constexpr char kExpectedNamePrefix[] = "RaceBox Mini ";
+constexpr size_t kNamePrefixLength = sizeof(kExpectedNamePrefix) - 1U;
+constexpr size_t kSerialDigits = 10U;
+constexpr unsigned long kMaxAllowedSerial = 3999999999UL;
 
-// --- BLE Configuration ---
-constexpr char kRaceBoxServiceUuid[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr char kRaceBoxCharacteristicRxUuid[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr char kRaceBoxCharacteristicTxUuid[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr char kDeviceInfoServiceUuid[] = "0000180a-0000-1000-8000-00805f9b34fb";
-constexpr char kModelCharacteristicUuid[] = "00002a24-0000-1000-8000-00805f9b34fb";
-constexpr char kSerialCharacteristicUuid[] = "00002a25-0000-1000-8000-00805f9b34fb";
-constexpr char kFirmwareCharacteristicUuid[] = "00002a26-0000-1000-8000-00805f9b34fb";
-constexpr char kHardwareCharacteristicUuid[] = "00002a27-0000-1000-8000-00805f9b34fb";
-constexpr char kManufacturerCharacteristicUuid[] = "00002a29-0000-1000-8000-00805f9b34fb";
 constexpr char kModelName[] = "RaceBox Mini";
 constexpr char kFirmwareRevision[] = "3.3";
 constexpr char kHardwareRevision[] = "1";
 constexpr char kManufacturerName[] = "RaceBox";
-constexpr uint16_t kRequestedBleMtu = 128U;
+}  // namespace DeviceIdentity
 
-BLEServer *pServer = NULL;
-BLECharacteristic *pCharacteristicTx = NULL;
-BLECharacteristic *pCharacteristicRx = NULL;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+namespace BleUuids {
+constexpr char kRaceBoxService[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kRaceBoxRxCharacteristic[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kRaceBoxTxCharacteristic[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char kNmeaService[] = "00001101-0000-1000-8000-00805F9B34FB";
+constexpr char kNmeaRxCharacteristic[] = "00001102-0000-1000-8000-00805F9B34FB";
+constexpr char kNmeaTxCharacteristic[] = "00001103-0000-1000-8000-00805F9B34FB";
+constexpr char kDeviceInfoService[] = "0000180a-0000-1000-8000-00805f9b34fb";
+constexpr char kModelCharacteristic[] = "00002a24-0000-1000-8000-00805f9b34fb";
+constexpr char kSerialCharacteristic[] = "00002a25-0000-1000-8000-00805f9b34fb";
+constexpr char kFirmwareCharacteristic[] = "00002a26-0000-1000-8000-00805f9b34fb";
+constexpr char kHardwareCharacteristic[] = "00002a27-0000-1000-8000-00805f9b34fb";
+constexpr char kManufacturerCharacteristic[] = "00002a29-0000-1000-8000-00805f9b34fb";
+}  // namespace BleUuids
 
-// --- Packet Timing ---
-unsigned long lastPacketSendTime = 0;
-constexpr uint32_t kPacketSendIntervalMs = 40UL;
-unsigned long lastGpsRateCheckTime = 0;
-unsigned int gpsUpdateCount = 0;
-constexpr uint32_t kGpsRateReportIntervalMs = 5000UL;
-unsigned int gnssUpdateCount = 0;
+namespace Timing {
+constexpr uint32_t kRateReportIntervalMs = 5000UL;
+constexpr float kRateReportIntervalSeconds =
+    static_cast<float>(kRateReportIntervalMs) / 1000.0f;
 constexpr uint32_t kDisconnectedBlinkIntervalMs = 500UL;
 constexpr uint32_t kRestartAdvertisingDelayMs = 500UL;
+constexpr uint32_t kGnssSerialRxBufferSize = 512UL;
+constexpr uint32_t kHaltLoopDelayMs = 100UL;
+}  // namespace Timing
 
-// --- RaceBox Packet Layout ---
+namespace Conversion {
+constexpr float kMetersPerSecondSquaredToMilliG = 1000.0f / 9.80665f;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kRadiansPerSecondToCentiDegrees = 18000.0f / kPi;
+constexpr double kLatLonToDegrees = 1e-7;
+}  // namespace Conversion
+
+namespace Protocol {
 constexpr uint8_t kUbxSyncChar1 = 0xB5U;
 constexpr uint8_t kUbxSyncChar2 = 0x62U;
-constexpr uint8_t kRaceBoxMessageClass = 0xFFU;
-constexpr uint8_t kRaceBoxMessageId = 0x01U;
-constexpr size_t kRaceBoxHeaderSize = 6U;
-constexpr size_t kRaceBoxPayloadSize = 80U;
-constexpr size_t kRaceBoxChecksumSize = 2U;
-constexpr size_t kRaceBoxPacketSize = kRaceBoxHeaderSize + kRaceBoxPayloadSize + kRaceBoxChecksumSize;
-constexpr int kPacketPayloadOffset = 6;
-constexpr int kPacketChecksumOffset = kPacketPayloadOffset + static_cast<int>(kRaceBoxPayloadSize);
-
-constexpr int kPayloadOffsetITow = 0;
-constexpr int kPayloadOffsetYear = 4;
-constexpr int kPayloadOffsetMonth = 6;
-constexpr int kPayloadOffsetDay = 7;
-constexpr int kPayloadOffsetHour = 8;
-constexpr int kPayloadOffsetMinute = 9;
-constexpr int kPayloadOffsetSecond = 10;
-constexpr int kPayloadOffsetValidityFlags = 11;
-constexpr int kPayloadOffsetTimeAccuracy = 12;
-constexpr int kPayloadOffsetNanoseconds = 16;
-constexpr int kPayloadOffsetFixType = 20;
-constexpr int kPayloadOffsetFixStatusFlags = 21;
-constexpr int kPayloadOffsetDateTimeFlags = 22;
-constexpr int kPayloadOffsetNumSv = 23;
-constexpr int kPayloadOffsetLongitude = 24;
-constexpr int kPayloadOffsetLatitude = 28;
-constexpr int kPayloadOffsetHeight = 32;
-constexpr int kPayloadOffsetHmsl = 36;
-constexpr int kPayloadOffsetHorizontalAccuracy = 40;
-constexpr int kPayloadOffsetVerticalAccuracy = 44;
-constexpr int kPayloadOffsetGroundSpeed = 48;
-constexpr int kPayloadOffsetHeadingOfMotion = 52;
-constexpr int kPayloadOffsetSpeedAccuracy = 56;
-constexpr int kPayloadOffsetHeadingAccuracy = 60;
-constexpr int kPayloadOffsetPdop = 64;
-constexpr int kPayloadOffsetLatLonFlags = 66;
-constexpr int kPayloadOffsetBatteryStatus = 67;
-constexpr int kPayloadOffsetAccelX = 68;
-constexpr int kPayloadOffsetAccelY = 70;
-constexpr int kPayloadOffsetAccelZ = 72;
-constexpr int kPayloadOffsetGyroX = 74;
-constexpr int kPayloadOffsetGyroY = 76;
-constexpr int kPayloadOffsetGyroZ = 78;
+constexpr uint8_t kMessageClass = 0xFFU;
+constexpr uint8_t kMessageId = 0x01U;
+constexpr size_t kHeaderSize = 6U;
+constexpr size_t kPayloadSize = 80U;
+constexpr size_t kChecksumSize = 2U;
+constexpr size_t kPacketSize = kHeaderSize + kPayloadSize + kChecksumSize;
+constexpr size_t kPayloadOffset = kHeaderSize;
+constexpr size_t kChecksumOffset = kPayloadOffset + kPayloadSize;
 constexpr uint8_t kReportedBatteryPercent = 100U;
-constexpr float kAccelerationToMilliG = 1000.0f / 9.80665f;
-constexpr float kGyroRadiansToCentiDegrees = 18000.0f / static_cast<float>(M_PI);
-constexpr float kGpsRateReportIntervalSeconds = kGpsRateReportIntervalMs / 1000.0f;
-constexpr double kLatLonToDegrees = 1e-7;
 
-std::array<uint8_t, kRaceBoxPayloadSize> txPayloadBuffer = {};
-std::array<uint8_t, kRaceBoxPacketSize> txPacketBuffer = {{
-  kUbxSyncChar1,
-  kUbxSyncChar2,
-  kRaceBoxMessageClass,
-  kRaceBoxMessageId,
-  static_cast<uint8_t>(kRaceBoxPayloadSize),
-  0U
+namespace Offset {
+constexpr size_t kITow = 0U;
+constexpr size_t kYear = 4U;
+constexpr size_t kMonth = 6U;
+constexpr size_t kDay = 7U;
+constexpr size_t kHour = 8U;
+constexpr size_t kMinute = 9U;
+constexpr size_t kSecond = 10U;
+constexpr size_t kValidityFlags = 11U;
+constexpr size_t kTimeAccuracy = 12U;
+constexpr size_t kNanoseconds = 16U;
+constexpr size_t kFixType = 20U;
+constexpr size_t kFixStatusFlags = 21U;
+constexpr size_t kDateTimeFlags = 22U;
+constexpr size_t kNumSv = 23U;
+constexpr size_t kLongitude = 24U;
+constexpr size_t kLatitude = 28U;
+constexpr size_t kHeight = 32U;
+constexpr size_t kHmsl = 36U;
+constexpr size_t kHorizontalAccuracy = 40U;
+constexpr size_t kVerticalAccuracy = 44U;
+constexpr size_t kGroundSpeed = 48U;
+constexpr size_t kHeadingOfMotion = 52U;
+constexpr size_t kSpeedAccuracy = 56U;
+constexpr size_t kHeadingAccuracy = 60U;
+constexpr size_t kPdop = 64U;
+constexpr size_t kLatLonFlags = 66U;
+constexpr size_t kBatteryStatus = 67U;
+constexpr size_t kAccelX = 68U;
+constexpr size_t kAccelY = 70U;
+constexpr size_t kAccelZ = 72U;
+constexpr size_t kGyroX = 74U;
+constexpr size_t kGyroY = 76U;
+constexpr size_t kGyroZ = 78U;
+}  // namespace Offset
+
+}  // namespace Protocol
+
+}  // namespace InternalConstants
+
+static_assert(
+    sizeof(UserSettings::Device::kName) ==
+        (InternalConstants::DeviceIdentity::kNamePrefixLength +
+         InternalConstants::DeviceIdentity::kSerialDigits + 1U),
+    "Device name must be 'RaceBox Mini ' followed by 10 digits.");
+static_assert(
+    InternalConstants::Protocol::kPacketSize ==
+        (InternalConstants::Protocol::kHeaderSize +
+         InternalConstants::Protocol::kPayloadSize +
+         InternalConstants::Protocol::kChecksumSize),
+    "Packet size must equal header + payload + checksum.");
+static_assert(
+    InternalConstants::Protocol::kChecksumOffset +
+            InternalConstants::Protocol::kChecksumSize ==
+        InternalConstants::Protocol::kPacketSize,
+    "Checksum offset must point at the last two bytes.");
+static_assert(
+    InternalConstants::Protocol::Offset::kGyroZ + sizeof(int16_t) ==
+        InternalConstants::Protocol::kPayloadSize,
+    "Payload layout no longer ends at gyro Z.");
+
+// ============================================================================
+// Runtime State
+// ============================================================================
+struct FilteredImuState {
+  float accelX = 0.0f;
+  float accelY = 0.0f;
+  float accelZ = 0.0f;
+  float gyroX = 0.0f;
+  float gyroY = 0.0f;
+  float gyroZ = 0.0f;
+};
+
+struct RuntimeCounters {
+  unsigned int blePacketCount = 0U;
+  unsigned int gnssUpdateCount = 0U;
+};
+
+struct RuntimeTimers {
+  unsigned long lastAccelReadMs = 0UL;
+  unsigned long lastDisconnectedBlinkMs = 0UL;
+  unsigned long lastRateReportMs = 0UL;
+};
+
+struct RuntimeState {
+  char deviceSerialNumber[InternalConstants::DeviceIdentity::kSerialDigits + 1U] = {};
+  FilteredImuState filteredImu{};
+  RuntimeCounters counters{};
+  RuntimeTimers timers{};
+  bool deviceConnected = false;
+  bool previousDeviceConnected = false;
+  uint32_t lastITow = 0U;
+};
+
+struct BleHandles {
+  BLEServer *server = nullptr;
+  BLECharacteristic *tx = nullptr;
+  BLECharacteristic *rx = nullptr;
+  BLECharacteristic *nmeaTx = nullptr;
+  BLECharacteristic *nmeaRx = nullptr;
+};
+
+struct EncodedImuSample {
+  int16_t accelX = 0;
+  int16_t accelY = 0;
+  int16_t accelZ = 0;
+  int16_t gyroX = 0;
+  int16_t gyroY = 0;
+  int16_t gyroZ = 0;
+};
+
+SFE_UBLOX_GNSS gGnss;
+HardwareSerial gGpsSerial(2);
+Adafruit_MPU6050 gMpu;
+
+RuntimeState gState;
+BleHandles gBle;
+
+std::array<uint8_t, InternalConstants::Protocol::kPayloadSize> gTxPayloadBuffer = {};
+std::array<uint8_t, InternalConstants::Protocol::kPacketSize> gTxPacketBuffer = {{
+    InternalConstants::Protocol::kUbxSyncChar1,
+    InternalConstants::Protocol::kUbxSyncChar2,
+    InternalConstants::Protocol::kMessageClass,
+    InternalConstants::Protocol::kMessageId,
+    static_cast<uint8_t>(InternalConstants::Protocol::kPayloadSize & 0xFFU),
+    static_cast<uint8_t>((InternalConstants::Protocol::kPayloadSize >> 8U) & 0xFFU),
 }};
 
-static_assert(kRaceBoxPacketSize == (kRaceBoxHeaderSize + kRaceBoxPayloadSize + kRaceBoxChecksumSize),
-              "RaceBox packet size must match header + payload + checksum.");
-static_assert(kPacketChecksumOffset + static_cast<int>(kRaceBoxChecksumSize) == static_cast<int>(kRaceBoxPacketSize),
-              "RaceBox checksum offset must point to the final two bytes.");
-static_assert(kPayloadOffsetGyroZ + static_cast<int>(sizeof(int16_t)) == static_cast<int>(kRaceBoxPayloadSize),
-              "RaceBox payload layout no longer ends at gyro Z.");
+// ============================================================================
+// BLE Callbacks
+// ============================================================================
+class RaceBoxServerCallbacks : public BLEServerCallbacks {
+ public:
+  void onConnect(BLEServer *server) override {
+    gState.deviceConnected = true;
 
-
-// --- BLE Callbacks ---
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) {
-    deviceConnected = true;
-    // Request a larger MTU to fit an 88-byte packet + headers in one go
-    if (pServer != NULL) {
-      pServer->updatePeerMTU(pServer->getConnId(), kRequestedBleMtu);
+    if (server != nullptr) {
+      server->updatePeerMTU(server->getConnId(), UserSettings::Ble::kRequestedMtu);
     }
-    digitalWrite(kOnboardLedPin, HIGH);
-    Serial.println("✅ BLE Client connected & MTU update requested");
+
+    digitalWrite(UserSettings::Device::kStatusLedPin, HIGH);
+    Serial.println("BLE client connected; MTU update requested.");
   }
-  void onDisconnect(BLEServer *pServer) {
-    deviceConnected = false;
-    digitalWrite(kOnboardLedPin, LOW);
-    Serial.println("❌ BLE Client disconnected");
+
+  void onDisconnect(BLEServer *server) override {
+    (void)server;
+    gState.deviceConnected = false;
+    digitalWrite(UserSettings::Device::kStatusLedPin, LOW);
+    Serial.println("BLE client disconnected.");
   }
 };
 
-class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
-    if (pCharacteristic == NULL) {
+class RaceBoxRxCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic *characteristic) override {
+    if (characteristic == nullptr) {
       return;
     }
 
-    uint8_t *rxValue = pCharacteristic->getData();
-    const size_t rxLength = pCharacteristic->getLength();
+    uint8_t *rxValue = characteristic->getData();
+    const size_t rxLength = characteristic->getLength();
 
-    if ((rxValue != NULL) && (rxLength > 0U)) {
-      Serial.print("📨 Received BLE command: ");
-      for (size_t i = 0; i < rxLength; ++i) {
-        Serial.printf("0x%02X ", rxValue[i]);
-      }
-      Serial.println();
+    if ((rxValue == nullptr) || (rxLength == 0U)) {
+      return;
     }
+
+    Serial.print("Received BLE command: ");
+    for (size_t i = 0; i < rxLength; ++i) {
+      Serial.printf("0x%02X ", rxValue[i]);
+    }
+    Serial.println();
   }
 };
 
-// --- UBX Packet Construction Helpers ---
-void writeLittleEndian(uint8_t* buffer, int offset, uint32_t value) { memcpy(buffer + offset, &value, 4); }
-void writeLittleEndian(uint8_t* buffer, int offset, int32_t value)  { memcpy(buffer + offset, &value, 4); }
-void writeLittleEndian(uint8_t* buffer, int offset, uint16_t value) { memcpy(buffer + offset, &value, 2); }
-void writeLittleEndian(uint8_t* buffer, int offset, int16_t value)  { memcpy(buffer + offset, &value, 2); }
-void writeLittleEndian(uint8_t* buffer, int offset, uint8_t value)  { buffer[offset] = value; }
-void writeLittleEndian(uint8_t* buffer, int offset, int8_t value)   { buffer[offset] = (uint8_t)value; }
+class NmeaRxCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic *characteristic) override {
+    (void)characteristic;
+  }
+};
 
-void calculateChecksum(uint8_t* payload, uint16_t len, uint8_t cls, uint8_t id, uint8_t* ckA, uint8_t* ckB) {
-  *ckA = *ckB = 0;
-  *ckA += cls; *ckB += *ckA;
-  *ckA += id; *ckB += *ckA;
-  *ckA += len & 0xFF; *ckB += *ckA;
-  *ckA += len >> 8; *ckB += *ckA;
-  for (uint16_t i = 0; i < len; i++) {
+// ============================================================================
+// Utility Helpers
+// ============================================================================
+[[noreturn]] void haltWithMessage(const char *message) {
+  Serial.println(message);
+  while (true) {
+    delay(InternalConstants::Timing::kHaltLoopDelayMs);
+  }
+}
+
+template <typename TObject>
+TObject *requireCreatedObject(TObject *object, const char *description) {
+  if (object == nullptr) {
+    Serial.print("Failed to create ");
+    Serial.println(description);
+    while (true) {
+      delay(InternalConstants::Timing::kHaltLoopDelayMs);
+    }
+  }
+
+  return object;
+}
+
+template <typename TValue, size_t kBufferSize>
+void writeLittleEndian(std::array<uint8_t, kBufferSize> &buffer, size_t offset,
+                       TValue value) {
+  memcpy(buffer.data() + offset, &value, sizeof(TValue));
+}
+
+void calculateUbxChecksum(const uint8_t *payload, uint16_t payloadLength,
+                          uint8_t messageClass, uint8_t messageId, uint8_t *ckA,
+                          uint8_t *ckB) {
+  *ckA = 0U;
+  *ckB = 0U;
+
+  *ckA += messageClass;
+  *ckB += *ckA;
+  *ckA += messageId;
+  *ckB += *ckA;
+  *ckA += payloadLength & 0xFFU;
+  *ckB += *ckA;
+  *ckA += payloadLength >> 8U;
+  *ckB += *ckA;
+
+  for (uint16_t i = 0U; i < payloadLength; ++i) {
     *ckA += payload[i];
     *ckB += *ckA;
   }
 }
 
-void* requireBleObject(void *object, const char *description) {
-  if (object == NULL) {
-    Serial.print("❌ Failed to create ");
-    Serial.println(description);
-    while (1) {
-      delay(100);
-    }
-  }
-
-  return object;
+float applyExponentialMovingAverage(float alpha, float sample, float filteredValue) {
+  return (alpha * sample) + ((1.0f - alpha) * filteredValue);
 }
 
 int16_t saturatingFloatToInt16(float value) {
@@ -246,397 +377,643 @@ int16_t saturatingFloatToInt16(float value) {
   return static_cast<int16_t>(value);
 }
 
+// ============================================================================
+// Device Identity
+// ============================================================================
+void validateDeviceNameOrHalt() {
+  const char *configuredName = UserSettings::Device::kName;
+  const char *serialSuffix =
+      configuredName + InternalConstants::DeviceIdentity::kNamePrefixLength;
+
+  if (strncmp(configuredName, InternalConstants::DeviceIdentity::kExpectedNamePrefix,
+              InternalConstants::DeviceIdentity::kNamePrefixLength) != 0) {
+    haltWithMessage("Device name must start with 'RaceBox Mini '.");
+  }
+
+  if (strspn(serialSuffix, "0123456789") !=
+      InternalConstants::DeviceIdentity::kSerialDigits) {
+    haltWithMessage("Device name suffix must contain exactly 10 digits.");
+  }
+
+  char *parsedEnd = nullptr;
+  const unsigned long serialValue = strtoul(serialSuffix, &parsedEnd, 10);
+
+  if ((parsedEnd == nullptr) || (*parsedEnd != '\0') ||
+      (serialValue > InternalConstants::DeviceIdentity::kMaxAllowedSerial)) {
+    haltWithMessage("RaceBox Mini number must be 3999999999 or lower.");
+  }
+
+  memcpy(gState.deviceSerialNumber, serialSuffix,
+         InternalConstants::DeviceIdentity::kSerialDigits);
+  gState.deviceSerialNumber[InternalConstants::DeviceIdentity::kSerialDigits] = '\0';
+}
+
+// ============================================================================
+// IMU Setup and Sampling
+// ============================================================================
+void seedImuFilterState() {
+  sensors_event_t accelEvent;
+  sensors_event_t gyroEvent;
+  sensors_event_t temperatureEvent;
+  gMpu.getEvent(&accelEvent, &gyroEvent, &temperatureEvent);
+
+  gState.filteredImu.accelX = accelEvent.acceleration.x;
+  gState.filteredImu.accelY = accelEvent.acceleration.y;
+  gState.filteredImu.accelZ = accelEvent.acceleration.z;
+  gState.filteredImu.gyroX = gyroEvent.gyro.x;
+  gState.filteredImu.gyroY = gyroEvent.gyro.y;
+  gState.filteredImu.gyroZ = gyroEvent.gyro.z;
+}
+
+void initializeImuOrHalt() {
+  if (!gMpu.begin()) {
+    haltWithMessage("Failed to find MPU6050 chip.");
+  }
+
+  gMpu.setAccelerometerRange(UserSettings::Imu::kAccelRange);
+  gMpu.setGyroRange(UserSettings::Imu::kGyroRange);
+  gMpu.setFilterBandwidth(UserSettings::Imu::kFilterBandwidth);
+  seedImuFilterState();
+}
+
+void updateFilteredImu(unsigned long now) {
+  if (gState.timers.lastAccelReadMs == 0UL) {
+    gState.timers.lastAccelReadMs = now;
+  }
+
+  bool shouldSample = false;
+  while ((now - gState.timers.lastAccelReadMs) >= UserSettings::Imu::kSampleIntervalMs) {
+    gState.timers.lastAccelReadMs += UserSettings::Imu::kSampleIntervalMs;
+    shouldSample = true;
+  }
+
+  if (!shouldSample) {
+    return;
+  }
+
+  sensors_event_t accelEvent;
+  sensors_event_t gyroEvent;
+  sensors_event_t temperatureEvent;
+  gMpu.getEvent(&accelEvent, &gyroEvent, &temperatureEvent);
+
+  gState.filteredImu.accelX = applyExponentialMovingAverage(
+      UserSettings::Imu::kAccelFilterAlpha, accelEvent.acceleration.x,
+      gState.filteredImu.accelX);
+  gState.filteredImu.accelY = applyExponentialMovingAverage(
+      UserSettings::Imu::kAccelFilterAlpha, accelEvent.acceleration.y,
+      gState.filteredImu.accelY);
+  gState.filteredImu.accelZ = applyExponentialMovingAverage(
+      UserSettings::Imu::kAccelFilterAlpha, accelEvent.acceleration.z,
+      gState.filteredImu.accelZ);
+
+  gState.filteredImu.gyroX = applyExponentialMovingAverage(
+      UserSettings::Imu::kGyroFilterAlpha, gyroEvent.gyro.x,
+      gState.filteredImu.gyroX);
+  gState.filteredImu.gyroY = applyExponentialMovingAverage(
+      UserSettings::Imu::kGyroFilterAlpha, gyroEvent.gyro.y,
+      gState.filteredImu.gyroY);
+  gState.filteredImu.gyroZ = applyExponentialMovingAverage(
+      UserSettings::Imu::kGyroFilterAlpha, gyroEvent.gyro.z,
+      gState.filteredImu.gyroZ);
+}
+
+EncodedImuSample encodeFilteredImuSample() {
+  EncodedImuSample encoded;
+
+  encoded.accelX = saturatingFloatToInt16(
+      gState.filteredImu.accelX *
+      InternalConstants::Conversion::kMetersPerSecondSquaredToMilliG);
+  encoded.accelY = saturatingFloatToInt16(
+      gState.filteredImu.accelY *
+      InternalConstants::Conversion::kMetersPerSecondSquaredToMilliG);
+  encoded.accelZ = saturatingFloatToInt16(
+      gState.filteredImu.accelZ *
+      InternalConstants::Conversion::kMetersPerSecondSquaredToMilliG);
+
+  encoded.gyroX = saturatingFloatToInt16(
+      gState.filteredImu.gyroX *
+      InternalConstants::Conversion::kRadiansPerSecondToCentiDegrees);
+  encoded.gyroY = saturatingFloatToInt16(
+      gState.filteredImu.gyroY *
+      InternalConstants::Conversion::kRadiansPerSecondToCentiDegrees);
+  encoded.gyroZ = saturatingFloatToInt16(
+      gState.filteredImu.gyroZ *
+      InternalConstants::Conversion::kRadiansPerSecondToCentiDegrees);
+
+  return encoded;
+}
+
+// ============================================================================
+// GNSS Setup
+// ============================================================================
 bool configureGnssUartOutput() {
-  if (myGNSS.setUART1Output(COM_TYPE_UBX)) {
+  if (gGnss.setUART1Output(COM_TYPE_UBX)) {
     return true;
   }
 
-  Serial.println("❌ Failed to set GNSS UART output to UBX only.");
+  Serial.println("Failed to set GNSS UART output to UBX only.");
   return false;
 }
 
-bool resetGpsBaudRate() {
-  Serial.println("Attempting to set Correct Baud Rate");
-  GPS_Serial.updateBaudRate(kFactoryGpsBaudRate);
+bool resetGnssBaudRate() {
+  Serial.println("Attempting to set correct GNSS baud rate.");
+  gGpsSerial.updateBaudRate(UserSettings::Gnss::kFactoryBaudRate);
   delay(500);
 
-  if (!myGNSS.begin(GPS_Serial)) {
+  if (!gGnss.begin(gGpsSerial)) {
     Serial.print("u-blox GNSS not detected at ");
-    Serial.print(kFactoryGpsBaudRate);
+    Serial.print(UserSettings::Gnss::kFactoryBaudRate);
     Serial.println(" baud.");
-    Serial.print("u-blox GNSS not detected, Check documentation for factory baud rate and/or check your wiring");
-    return false;
-  } else {
-    Serial.print("GNSS detected at ");
-    Serial.print(kFactoryGpsBaudRate);
-    Serial.println(" baud!");
-  }
-  delay(500);
-
-  // Now switch baud rate
-  Serial.print("Setting baud rate to ");
-  Serial.print(kGpsBaudRate);
-  Serial.println("...");
-  myGNSS.setSerialRate(kGpsBaudRate);
-  Serial.print("Baud rate changed to ");
-  Serial.println(kGpsBaudRate);
-
-  GPS_Serial.updateBaudRate(kGpsBaudRate);
-  delay(500);
-
-  if (!myGNSS.begin(GPS_Serial)) {
-    Serial.print("GNSS not detected at ");
-    Serial.print(kGpsBaudRate);
-    Serial.println(" baud.");
-    Serial.print("u-blox GNSS not detected, Check documentation for factory baud rate and/or check your wiring");
+    Serial.println("Check GNSS wiring and the factory baud rate for your module.");
     return false;
   }
+
   Serial.print("GNSS detected at ");
-  Serial.print(kGpsBaudRate);
-  Serial.println(" baud! Saving I/O port settings to Flash");
+  Serial.print(UserSettings::Gnss::kFactoryBaudRate);
+  Serial.println(" baud.");
+
+  Serial.print("Setting baud rate to ");
+  Serial.print(UserSettings::Gnss::kBaudRate);
+  Serial.println("...");
+  gGnss.setSerialRate(UserSettings::Gnss::kBaudRate);
+
+  gGpsSerial.updateBaudRate(UserSettings::Gnss::kBaudRate);
+  delay(500);
+
+  if (!gGnss.begin(gGpsSerial)) {
+    Serial.print("GNSS not detected at ");
+    Serial.print(UserSettings::Gnss::kBaudRate);
+    Serial.println(" baud.");
+    Serial.println("Check GNSS wiring and the configured baud rate.");
+    return false;
+  }
+
+  Serial.print("GNSS detected at ");
+  Serial.print(UserSettings::Gnss::kBaudRate);
+  Serial.println(" baud. Saving UART settings to flash.");
+
   if (!configureGnssUartOutput()) {
     return false;
   }
-  myGNSS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);
+
+  gGnss.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);
   return true;
 }
 
-void validateDeviceNameOrHalt() {
-  const char *suffix = kDeviceName + kDeviceNamePrefixLength;
-
-  if (strncmp(kDeviceName, "RaceBox Mini ", kDeviceNamePrefixLength) != 0) {
-    Serial.println("❌ Device name must start with 'RaceBox Mini '.");
-    while (1) {
-      delay(100);
-    }
-  }
-
-  if (strspn(suffix, "0123456789") != kDeviceNameSuffixLength) {
-    Serial.println("❌ Device name suffix must contain exactly 10 digits.");
-    while (1) {
-      delay(100);
-    }
-  }
-
-  char *parsedEnd = NULL;
-  const unsigned long suffixValue = strtoul(suffix, &parsedEnd, 10);
-
-  if ((parsedEnd == NULL) || (*parsedEnd != '\0') || (suffixValue > kMaxAllowedDeviceSuffix)) {
-    Serial.println("❌ RaceBox Mini number must be 3999999999 or lower.");
-    while (1) {
-      delay(100);
-    }
-  }
-
-  memcpy(deviceSerialNumber, suffix, kDeviceNameSuffixLength);
-  deviceSerialNumber[kDeviceNameSuffixLength] = '\0';
-}
-
 void configureGnssConstellations() {
-  for (size_t i = 0; i < (sizeof(kGnssConstellations) / sizeof(kGnssConstellations[0])); ++i) {
-    const GnssConstellationConfig &config = kGnssConstellations[i];
-    const bool configured = myGNSS.enableGNSS(config.enabled, config.id);
+  const size_t constellationCount =
+      sizeof(UserSettings::Gnss::kConstellations) /
+      sizeof(UserSettings::Gnss::kConstellations[0]);
+
+  for (size_t i = 0; i < constellationCount; ++i) {
+    const UserSettings::Gnss::ConstellationSetting &config =
+        UserSettings::Gnss::kConstellations[i];
+    const bool configured = gGnss.enableGNSS(config.enabled, config.id);
 
     if (configured) {
-      Serial.print(config.enabled ? "✅ " : "🚫 ");
       Serial.print(config.name);
       Serial.println(config.enabled ? " enabled." : " disabled.");
-    } else {
-      Serial.print("❌ Failed to ");
-      Serial.print(config.enabled ? "enable " : "disable ");
-      Serial.print(config.name);
-      Serial.println(".");
+      continue;
     }
+
+    Serial.print("Failed to ");
+    Serial.print(config.enabled ? "enable " : "disable ");
+    Serial.print(config.name);
+    Serial.println(".");
   }
 }
 
-void setup() {
-  Serial.begin(kSerialBaudRate);
-  pinMode(kOnboardLedPin, OUTPUT);
-  validateDeviceNameOrHalt();
-  if (!mpu.begin()) {
-    Serial.println("❌ Failed to find MPU6050 chip");
-    while (1) delay(100);
-  }
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+void initializeGnssOrHalt() {
+  gGpsSerial.setRxBufferSize(InternalConstants::Timing::kGnssSerialRxBufferSize);
+  gGpsSerial.begin(UserSettings::Gnss::kBaudRate, SERIAL_8N1, UserSettings::Gnss::kRxPin,
+                   UserSettings::Gnss::kTxPin);
 
-  // Initialize filters with the first real reading so they don't start at zero
-  filtered_ax = a.acceleration.x;
-  filtered_ay = a.acceleration.y;
-  filtered_az = a.acceleration.z;
-  filtered_gx = g.gyro.x;
-  filtered_gy = g.gyro.y;
-  filtered_gz = g.gyro.z;
-
-  GPS_Serial.setRxBufferSize(512);
-  GPS_Serial.begin(kGpsBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
-  if (!myGNSS.begin(GPS_Serial)) {
-    Serial.println("❌ GNSS not detected. Attempting to configure.");
-    if (!resetGpsBaudRate()) {
-      while (1) {
-        delay(100);
-      }
+  if (!gGnss.begin(gGpsSerial)) {
+    Serial.println("GNSS not detected at the configured baud rate; attempting recovery.");
+    if (!resetGnssBaudRate()) {
+      haltWithMessage("Unable to initialize the GNSS module.");
     }
   }
 
-  // Set GNSS output to PVT only
   configureGnssUartOutput();
-  myGNSS.setAutoPVT(true);
-  myGNSS.setDynamicModel(DYN_MODEL_AUTOMOTIVE);
-    // --- Configure GPS update rate to kMaxNavigationRateHz Hz ---
-  if (myGNSS.setNavigationFrequency(kMaxNavigationRateHz)) {
-  Serial.printf("✅ GPS update rate set to %d Hz.\n",kMaxNavigationRateHz );
+  gGnss.setAutoPVT(true);
+  gGnss.setDynamicModel(DYN_MODEL_AUTOMOTIVE);
+
+  if (gGnss.setNavigationFrequency(UserSettings::Gnss::kNavigationRateHz)) {
+    Serial.printf("GPS update rate set to %u Hz.\n",
+                  static_cast<unsigned int>(UserSettings::Gnss::kNavigationRateHz));
   } else {
-    Serial.println("❌ Failed to set GPS update rate.");
+    Serial.println("Failed to set GPS update rate.");
   }
 
-  // --- GNSS Constellation Setup ---
   configureGnssConstellations();
+}
 
-  // --- BLE Setup ---
-  BLEDevice::init(kDeviceName);
-  pServer = static_cast<BLEServer*>(requireBleObject(BLEDevice::createServer(), "BLE server"));
-  pServer->setCallbacks(new MyServerCallbacks());
+// ============================================================================
+// BLE Setup
+// ============================================================================
+BLECharacteristic *createReadOnlyCharacteristic(BLEService *service, const char *uuid,
+                                                const char *description) {
+  return requireCreatedObject(
+      service->createCharacteristic(uuid, BLECharacteristic::PROPERTY_READ), description);
+}
 
-  BLEService *pService = static_cast<BLEService*>(requireBleObject(pServer->createService(kRaceBoxServiceUuid), "RaceBox BLE service"));
-  pCharacteristicTx = static_cast<BLECharacteristic*>(requireBleObject(pService->createCharacteristic(kRaceBoxCharacteristicTxUuid, BLECharacteristic::PROPERTY_NOTIFY), "RaceBox TX characteristic"));
-  pCharacteristicTx->addDescriptor(static_cast<BLE2902*>(requireBleObject(new BLE2902(), "RaceBox TX descriptor")));
-  pCharacteristicRx = static_cast<BLECharacteristic*>(requireBleObject(pService->createCharacteristic(kRaceBoxCharacteristicRxUuid, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR), "RaceBox RX characteristic"));
-  pCharacteristicRx->setCallbacks(new MyCharacteristicCallbacks());
-  pService->start();
-  // --- Device Information Service ---
-  BLEService *pDeviceInfo = static_cast<BLEService*>(requireBleObject(pServer->createService(kDeviceInfoServiceUuid), "Device Information service"));
-  // Model
-  BLECharacteristic *pModel = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kModelCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device model characteristic"));
-  pModel->setValue(kModelName);
-  // Serial number (last 10 digits of device name)
-  BLECharacteristic *pSerial = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kSerialCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device serial characteristic"));
-  pSerial->setValue(reinterpret_cast<uint8_t*>(deviceSerialNumber), kDeviceNameSuffixLength);
-  // Firmware revision
-  BLECharacteristic *pFirm = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kFirmwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device firmware characteristic"));
-  pFirm->setValue(kFirmwareRevision);
-  // Hardware revision
-  BLECharacteristic *pHardware = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kHardwareCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device hardware characteristic"));
-  pHardware->setValue(kHardwareRevision);
-  // Manufacturer
-  BLECharacteristic *pManufacturer = static_cast<BLECharacteristic*>(requireBleObject(pDeviceInfo->createCharacteristic(kManufacturerCharacteristicUuid, BLECharacteristic::PROPERTY_READ), "Device manufacturer characteristic"));
-  pManufacturer->setValue(kManufacturerName);
-  pDeviceInfo->start();
-  BLEAdvertising *pAdvertising = static_cast<BLEAdvertising*>(requireBleObject(BLEDevice::getAdvertising(), "BLE advertising"));
-  pAdvertising->addServiceUUID(kRaceBoxServiceUuid);
-  // Advertise Device Information Service to help official apps discover the device
-  pAdvertising->addServiceUUID(kDeviceInfoServiceUuid);
-  pAdvertising->setScanResponse(true);
+void initializeRaceBoxService(BLEServer *server) {
+  BLEService *service = requireCreatedObject(
+      server->createService(InternalConstants::BleUuids::kRaceBoxService),
+      "RaceBox BLE service");
+
+  gBle.tx = requireCreatedObject(
+      service->createCharacteristic(InternalConstants::BleUuids::kRaceBoxTxCharacteristic,
+                                    BLECharacteristic::PROPERTY_NOTIFY),
+      "RaceBox TX characteristic");
+  gBle.tx->addDescriptor(requireCreatedObject(new BLE2902(), "RaceBox TX descriptor"));
+
+  gBle.rx = requireCreatedObject(
+      service->createCharacteristic(InternalConstants::BleUuids::kRaceBoxRxCharacteristic,
+                                    BLECharacteristic::PROPERTY_WRITE |
+                                        BLECharacteristic::PROPERTY_WRITE_NR),
+      "RaceBox RX characteristic");
+  gBle.rx->setCallbacks(new RaceBoxRxCallbacks());
+
+  service->start();
+}
+
+void initializeNmeaService(BLEServer *server) {
+  BLEService *service = requireCreatedObject(
+      server->createService(InternalConstants::BleUuids::kNmeaService),
+      "NMEA BLE service");
+
+  gBle.nmeaTx = requireCreatedObject(
+      service->createCharacteristic(InternalConstants::BleUuids::kNmeaTxCharacteristic,
+                                    BLECharacteristic::PROPERTY_NOTIFY),
+      "NMEA TX characteristic");
+  gBle.nmeaTx->addDescriptor(requireCreatedObject(new BLE2902(), "NMEA TX descriptor"));
+
+  gBle.nmeaRx = requireCreatedObject(
+      service->createCharacteristic(InternalConstants::BleUuids::kNmeaRxCharacteristic,
+                                    BLECharacteristic::PROPERTY_WRITE |
+                                        BLECharacteristic::PROPERTY_WRITE_NR),
+      "NMEA RX characteristic");
+  gBle.nmeaRx->setCallbacks(new NmeaRxCallbacks());
+
+  service->start();
+}
+
+void initializeDeviceInformationService(BLEServer *server) {
+  BLEService *service = requireCreatedObject(
+      server->createService(InternalConstants::BleUuids::kDeviceInfoService),
+      "Device Information service");
+
+  createReadOnlyCharacteristic(service, InternalConstants::BleUuids::kModelCharacteristic,
+                               "Device model characteristic")
+      ->setValue(InternalConstants::DeviceIdentity::kModelName);
+
+  createReadOnlyCharacteristic(service, InternalConstants::BleUuids::kSerialCharacteristic,
+                               "Device serial characteristic")
+      ->setValue(reinterpret_cast<uint8_t *>(gState.deviceSerialNumber),
+                 InternalConstants::DeviceIdentity::kSerialDigits);
+
+  createReadOnlyCharacteristic(
+      service, InternalConstants::BleUuids::kFirmwareCharacteristic,
+      "Device firmware characteristic")
+      ->setValue(InternalConstants::DeviceIdentity::kFirmwareRevision);
+
+  createReadOnlyCharacteristic(
+      service, InternalConstants::BleUuids::kHardwareCharacteristic,
+      "Device hardware characteristic")
+      ->setValue(InternalConstants::DeviceIdentity::kHardwareRevision);
+
+  createReadOnlyCharacteristic(
+      service, InternalConstants::BleUuids::kManufacturerCharacteristic,
+      "Device manufacturer characteristic")
+      ->setValue(InternalConstants::DeviceIdentity::kManufacturerName);
+
+  service->start();
+}
+
+void startBleAdvertising() {
+  BLEAdvertising *advertising =
+      requireCreatedObject(BLEDevice::getAdvertising(), "BLE advertising");
+  advertising->addServiceUUID(InternalConstants::BleUuids::kRaceBoxService);
+  advertising->addServiceUUID(InternalConstants::BleUuids::kNmeaService);
+  advertising->addServiceUUID(InternalConstants::BleUuids::kDeviceInfoService);
+  advertising->setScanResponse(true);
+
   BLEDevice::startAdvertising();
-  Serial.println("📡 BLE advertising started.");
+  Serial.println("BLE advertising started.");
+}
 
-  lastGpsRateCheckTime = millis();
+void initializeBleOrHalt() {
+  BLEDevice::init(UserSettings::Device::kName);
+
+  gBle.server = requireCreatedObject(BLEDevice::createServer(), "BLE server");
+  gBle.server->setCallbacks(new RaceBoxServerCallbacks());
+
+  initializeRaceBoxService(gBle.server);
+  initializeNmeaService(gBle.server);
+  initializeDeviceInformationService(gBle.server);
+  startBleAdvertising();
+}
+
+// ============================================================================
+// RaceBox Packet Assembly
+// ============================================================================
+uint8_t buildValidityFlags(const UBX_NAV_PVT_t *navPvtPacket) {
+  const auto &navData = navPvtPacket->data;
+  uint8_t flags = 0U;
+
+  if (navData.valid.bits.validDate) {
+    flags |= (1U << 0U);
+  }
+  if (navData.valid.bits.validTime) {
+    flags |= (1U << 1U);
+  }
+  if (navData.valid.bits.fullyResolved) {
+    flags |= (1U << 2U);
+  }
+
+  return flags;
+}
+
+uint8_t buildFixStatusFlags(const UBX_NAV_PVT_t *navPvtPacket) {
+  const auto &navData = navPvtPacket->data;
+  uint8_t flags = 0U;
+
+  if (navData.fixType == 3U) {
+    flags |= (1U << 0U);
+  }
+  if (gGnss.getHeadVehValid()) {
+    flags |= (1U << 5U);
+  }
+
+  return flags;
+}
+
+uint8_t buildDateTimeFlags(const UBX_NAV_PVT_t *navPvtPacket) {
+  const auto &navData = navPvtPacket->data;
+  uint8_t flags = 0U;
+
+  if (navData.valid.bits.validTime) {
+    flags |= (1U << 5U);
+  }
+  if (navData.valid.bits.validDate) {
+    flags |= (1U << 6U);
+  }
+  if (navData.valid.bits.validTime && navData.valid.bits.fullyResolved) {
+    flags |= (1U << 7U);
+  }
+
+  return flags;
+}
+
+uint8_t buildLatLonFlags(const UBX_NAV_PVT_t *navPvtPacket) {
+  const auto &navData = navPvtPacket->data;
+  uint8_t flags = 0U;
+
+  if (navData.fixType < 2U) {
+    flags |= (1U << 0U);
+  }
+
+  return flags;
+}
+
+void populateRaceBoxPayload(const UBX_NAV_PVT_t *navPvtPacket) {
+  gTxPayloadBuffer.fill(0U);
+
+  const auto &navData = navPvtPacket->data;
+  const EncodedImuSample imuSample = encodeFilteredImuSample();
+
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kITow,
+                    navData.iTOW);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kYear,
+                    navData.year);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kMonth,
+                    navData.month);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kDay,
+                    navData.day);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHour,
+                    navData.hour);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kMinute,
+                    navData.min);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kSecond,
+                    navData.sec);
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kValidityFlags,
+                    buildValidityFlags(navPvtPacket));
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kTimeAccuracy,
+                    navData.tAcc);
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kNanoseconds, navData.nano);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kFixType,
+                    navData.fixType);
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kFixStatusFlags,
+                    buildFixStatusFlags(navPvtPacket));
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kDateTimeFlags,
+                    buildDateTimeFlags(navPvtPacket));
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kNumSv,
+                    navData.numSV);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kLongitude,
+                    navData.lon);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kLatitude,
+                    navData.lat);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHeight,
+                    navData.height);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHmsl,
+                    navData.hMSL);
+  writeLittleEndian(
+      gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHorizontalAccuracy,
+      navData.hAcc);
+  writeLittleEndian(
+      gTxPayloadBuffer, InternalConstants::Protocol::Offset::kVerticalAccuracy,
+      navData.vAcc);
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kGroundSpeed,
+                    navData.gSpeed);
+  writeLittleEndian(
+      gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHeadingOfMotion,
+      navData.headMot);
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kSpeedAccuracy,
+                    navData.sAcc);
+  writeLittleEndian(
+      gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHeadingAccuracy,
+      navData.headAcc);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kPdop,
+                    navData.pDOP);
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kLatLonFlags,
+                    buildLatLonFlags(navPvtPacket));
+  writeLittleEndian(gTxPayloadBuffer,
+                    InternalConstants::Protocol::Offset::kBatteryStatus,
+                    InternalConstants::Protocol::kReportedBatteryPercent);
+
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kAccelX,
+                    imuSample.accelX);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kAccelY,
+                    imuSample.accelY);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kAccelZ,
+                    imuSample.accelZ);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kGyroX,
+                    imuSample.gyroX);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kGyroY,
+                    imuSample.gyroY);
+  writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kGyroZ,
+                    imuSample.gyroZ);
+}
+
+void finalizeRaceBoxPacket() {
+  memcpy(gTxPacketBuffer.data() + InternalConstants::Protocol::kPayloadOffset,
+         gTxPayloadBuffer.data(), InternalConstants::Protocol::kPayloadSize);
+
+  uint8_t ckA = 0U;
+  uint8_t ckB = 0U;
+  calculateUbxChecksum(
+      gTxPayloadBuffer.data(), InternalConstants::Protocol::kPayloadSize,
+      InternalConstants::Protocol::kMessageClass,
+      InternalConstants::Protocol::kMessageId, &ckA, &ckB);
+
+  gTxPacketBuffer[InternalConstants::Protocol::kChecksumOffset] = ckA;
+  gTxPacketBuffer[InternalConstants::Protocol::kChecksumOffset + 1U] = ckB;
+}
+
+void sendRaceBoxPacket(const UBX_NAV_PVT_t *navPvtPacket) {
+  if (!gState.deviceConnected || (gBle.tx == nullptr) || (navPvtPacket == nullptr)) {
+    return;
+  }
+
+  populateRaceBoxPayload(navPvtPacket);
+  finalizeRaceBoxPacket();
+
+  gBle.tx->setValue(gTxPacketBuffer.data(), InternalConstants::Protocol::kPacketSize);
+  gBle.tx->notify();
+  gState.counters.blePacketCount++;
+}
+
+// ============================================================================
+// Loop Tasks
+// ============================================================================
+void updateConnectionLed(unsigned long now) {
+  if (gState.deviceConnected) {
+    digitalWrite(UserSettings::Device::kStatusLedPin, HIGH);
+    return;
+  }
+
+  if ((now - gState.timers.lastDisconnectedBlinkMs) >
+      InternalConstants::Timing::kDisconnectedBlinkIntervalMs) {
+    gState.timers.lastDisconnectedBlinkMs = now;
+    digitalWrite(UserSettings::Device::kStatusLedPin,
+                 !digitalRead(UserSettings::Device::kStatusLedPin));
+  }
+}
+
+bool isNewNavigationEpoch(const UBX_NAV_PVT_t *navPvtPacket) {
+  if (navPvtPacket == nullptr) {
+    return false;
+  }
+
+  const uint32_t currentITow = navPvtPacket->data.iTOW;
+  if (currentITow == gState.lastITow) {
+    return false;
+  }
+
+  gState.lastITow = currentITow;
+  return true;
+}
+
+void reportRatesIfDue(unsigned long now, const UBX_NAV_PVT_t *navPvtPacket) {
+  if ((now - gState.timers.lastRateReportMs) <
+      InternalConstants::Timing::kRateReportIntervalMs) {
+    return;
+  }
+
+  float bleRate = static_cast<float>(gState.counters.blePacketCount) /
+                  InternalConstants::Timing::kRateReportIntervalSeconds;
+  float gnssRate = static_cast<float>(gState.counters.gnssUpdateCount) /
+                   InternalConstants::Timing::kRateReportIntervalSeconds;
+
+  unsigned int satellites = 0U;
+  unsigned int fixType = 0U;
+  unsigned long horizontalAccuracy = 0UL;
+  double latitude = 0.0;
+  double longitude = 0.0;
+
+  if (navPvtPacket != nullptr) {
+    const auto &navData = navPvtPacket->data;
+    satellites = static_cast<unsigned int>(navData.numSV);
+    fixType = static_cast<unsigned int>(navData.fixType);
+    horizontalAccuracy = static_cast<unsigned long>(navData.hAcc);
+    latitude = static_cast<double>(navData.lat) *
+               InternalConstants::Conversion::kLatLonToDegrees;
+    longitude = static_cast<double>(navData.lon) *
+                InternalConstants::Conversion::kLatLonToDegrees;
+  }
+
+  Serial.printf(
+      "BLE packet rate: %.2f Hz | GNSS update rate: %.2f Hz | SVs: %u | Fix: %u | "
+      "HAcc: %lu mm | Lat: %.7f Lon: %.7f\n",
+      bleRate, gnssRate, satellites, fixType, horizontalAccuracy, latitude,
+      longitude);
+
+  gState.counters.blePacketCount = 0U;
+  gState.counters.gnssUpdateCount = 0U;
+  gState.timers.lastRateReportMs = now;
+}
+
+void updateBleAdvertisingState() {
+  if (!gState.deviceConnected && gState.previousDeviceConnected) {
+    delay(InternalConstants::Timing::kRestartAdvertisingDelayMs);
+    if (gBle.server != nullptr) {
+      gBle.server->startAdvertising();
+    }
+    gState.previousDeviceConnected = false;
+    return;
+  }
+
+  if (gState.deviceConnected && !gState.previousDeviceConnected) {
+    gState.previousDeviceConnected = true;
+  }
+}
+
+void processGnssData(unsigned long now) {
+  if (!gGnss.getPVT()) {
+    return;
+  }
+
+  const UBX_NAV_PVT_t *navPvtPacket = gGnss.packetUBXNAVPVT;
+
+  if (isNewNavigationEpoch(navPvtPacket)) {
+    gState.counters.gnssUpdateCount++;
+    sendRaceBoxPacket(navPvtPacket);
+  }
+
+  reportRatesIfDue(now, navPvtPacket);
+}
+
+// ============================================================================
+// Arduino Entry Points
+// ============================================================================
+void setup() {
+  Serial.begin(UserSettings::kSerialBaudRate);
+  pinMode(UserSettings::Device::kStatusLedPin, OUTPUT);
+
+  validateDeviceNameOrHalt();
+  initializeImuOrHalt();
+  initializeGnssOrHalt();
+  initializeBleOrHalt();
+
+  gState.timers.lastRateReportMs = millis();
 }
 
 void loop() {
   const unsigned long now = millis();
-  myGNSS.checkUblox(); // Required to keep GNSS data flowing
-  static unsigned long lastAccelReadMs = 0;
 
-  if (lastAccelReadMs == 0UL) {
-    lastAccelReadMs = now;
-  }
-
-  // Update Accelrometer readings at fixed interval
-  bool shouldReadAccel = false;
-  while ((now - lastAccelReadMs) >= kAccelSampleIntervalMs) {
-    lastAccelReadMs += kAccelSampleIntervalMs; // Stay on the fixed timing grid if the loop slips.
-    shouldReadAccel = true;
-  }
-
-  if (shouldReadAccel) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
-    // Apply Exponential Moving Average (Complementary Filter logic)
-    filtered_ax = (accelAlpha * a.acceleration.x) + ((1.0 - accelAlpha) * filtered_ax);
-    filtered_ay = (accelAlpha * a.acceleration.y) + ((1.0 - accelAlpha) * filtered_ay);
-    filtered_az = (accelAlpha * a.acceleration.z) + ((1.0 - accelAlpha) * filtered_az);
-
-    filtered_gx = (gyroAlpha * g.gyro.x) + ((1.0 - gyroAlpha) * filtered_gx);
-    filtered_gy = (gyroAlpha * g.gyro.y) + ((1.0 - gyroAlpha) * filtered_gy);
-    filtered_gz = (gyroAlpha * g.gyro.z) + ((1.0 - gyroAlpha) * filtered_gz);
-  }
-  // LED Blink Logic
-  if (!deviceConnected) {
-    static unsigned long lastBlinkMs = 0;
-    if ((now - lastBlinkMs) > kDisconnectedBlinkIntervalMs) {
-      lastBlinkMs = now;
-      digitalWrite(kOnboardLedPin, !digitalRead(kOnboardLedPin));
-    }
-  } else {
-    digitalWrite(kOnboardLedPin, HIGH);
-  }
-  if (myGNSS.getPVT()) {
-    const UBX_NAV_PVT_t *navPvtPacket = myGNSS.packetUBXNAVPVT;
-    static uint32_t lastITOW = 0;
-    uint32_t currentITOW = 0;
-
-    if (navPvtPacket != NULL) {
-      currentITOW = navPvtPacket->data.iTOW;
-    }
-
-    if ((navPvtPacket != NULL) && (currentITOW != lastITOW)) {
-      lastITOW = currentITOW;
-      gnssUpdateCount++;
-
-      if (deviceConnected && (pCharacteristicTx != NULL)) {
-        lastPacketSendTime = now;
-        gpsUpdateCount++;
-        const auto &navData = navPvtPacket->data;
-
-        // Convert accelerometer to milli-g (1g = 9.80665 m/s^2)
-        const float accelXMilliG = filtered_ax * kAccelerationToMilliG;
-        const float accelYMilliG = filtered_ay * kAccelerationToMilliG;
-        const float accelZMilliG = filtered_az * kAccelerationToMilliG;
-        const int16_t gX = saturatingFloatToInt16(accelXMilliG);
-        const int16_t gY = saturatingFloatToInt16(accelYMilliG);
-        const int16_t gZ = saturatingFloatToInt16(accelZMilliG);
-
-        // Convert gyro to centi-deg/sec
-        const float gyroXCentiDegrees = filtered_gx * kGyroRadiansToCentiDegrees;
-        const float gyroYCentiDegrees = filtered_gy * kGyroRadiansToCentiDegrees;
-        const float gyroZCentiDegrees = filtered_gz * kGyroRadiansToCentiDegrees;
-        const int16_t rX = saturatingFloatToInt16(gyroXCentiDegrees);
-        const int16_t rY = saturatingFloatToInt16(gyroYCentiDegrees);
-        const int16_t rZ = saturatingFloatToInt16(gyroZCentiDegrees);
-
-        uint8_t *payload = txPayloadBuffer.data();
-        uint8_t *packet = txPacketBuffer.data();
-
-        // Access data directly from navData
-        writeLittleEndian(payload, kPayloadOffsetITow, navData.iTOW);
-        writeLittleEndian(payload, kPayloadOffsetYear, navData.year);
-        writeLittleEndian(payload, kPayloadOffsetMonth, navData.month);
-        writeLittleEndian(payload, kPayloadOffsetDay, navData.day);
-        writeLittleEndian(payload, kPayloadOffsetHour, navData.hour);
-        writeLittleEndian(payload, kPayloadOffsetMinute, navData.min);
-        writeLittleEndian(payload, kPayloadOffsetSecond, navData.sec);
-
-        // Offset 11: Validity Flags (RaceBox Protocol) 
-        uint8_t raceboxValidityFlags = 0;
-        if (navData.valid.bits.validDate) raceboxValidityFlags |= (1 << 0); // Bit 0: valid date 
-        if (navData.valid.bits.validTime) raceboxValidityFlags |= (1 << 1); // Bit 1: valid time 
-        if (navData.valid.bits.fullyResolved) raceboxValidityFlags |= (1 << 2); // Bit 2: fully resolved 
-        writeLittleEndian(payload, kPayloadOffsetValidityFlags, raceboxValidityFlags);
-
-        // Offset 12: Time Accuracy (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetTimeAccuracy, navData.tAcc);
-
-        // Offset 16: Nanoseconds (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetNanoseconds, navData.nano);
-
-        // Offset 20: Fix Status (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetFixType, navData.fixType);
-
-        // Offset 21: Fix Status Flags (RaceBox Protocol)
-        uint8_t fixStatusFlagsRacebox = 0;
-
-        if (navData.fixType == 3) {
-            fixStatusFlagsRacebox |= (1 << 0); // Bit 0: valid fix
-        }
-
-        if (myGNSS.getHeadVehValid()) { // Use the confirmed function to check for valid heading
-            fixStatusFlagsRacebox |= (1 << 5); // Bit 5: valid heading (as per RaceBox Protocol)
-        }
-        writeLittleEndian(payload, kPayloadOffsetFixStatusFlags, fixStatusFlagsRacebox);
-
-        // Offset 22: Date/Time Flags (RaceBox Protocol) 
-        uint8_t raceboxDateTimeFlags = 0;
-        if (navData.valid.bits.validTime) raceboxDateTimeFlags |= (1 << 5); // Available confirmation of Date/Time Validity
-        if (navData.valid.bits.validDate) raceboxDateTimeFlags |= (1 << 6); // Confirmed UTC Date Validity
-        if (navData.valid.bits.validTime && navData.valid.bits.fullyResolved) raceboxDateTimeFlags |= (1 << 7); // Confirmed UTC Time Validity
-        writeLittleEndian(payload, kPayloadOffsetDateTimeFlags, raceboxDateTimeFlags);
-
-        // Offset 23: Number of SVs (RaceBox Protocol) 
-        writeLittleEndian(payload, kPayloadOffsetNumSv, navData.numSV);
-
-        // Remaining fields, mostly direct mappings from u-blox data
-        writeLittleEndian(payload, kPayloadOffsetLongitude, navData.lon);
-        writeLittleEndian(payload, kPayloadOffsetLatitude, navData.lat);
-        writeLittleEndian(payload, kPayloadOffsetHeight, navData.height);
-        writeLittleEndian(payload, kPayloadOffsetHmsl, navData.hMSL);
-
-        writeLittleEndian(payload, kPayloadOffsetHorizontalAccuracy, navData.hAcc);
-        writeLittleEndian(payload, kPayloadOffsetVerticalAccuracy, navData.vAcc);
-        writeLittleEndian(payload, kPayloadOffsetGroundSpeed, navData.gSpeed);
-        writeLittleEndian(payload, kPayloadOffsetHeadingOfMotion, navData.headMot);
-        writeLittleEndian(payload, kPayloadOffsetSpeedAccuracy, navData.sAcc);
-        writeLittleEndian(payload, kPayloadOffsetHeadingAccuracy, navData.headAcc);
-
-        writeLittleEndian(payload, kPayloadOffsetPdop, navData.pDOP);
-
-        // Offset 66: Lat/Lon Flags (RaceBox Protocol) 
-        uint8_t latLonFlags = 0;
-        if (navData.fixType < 2) { // If no 2D/3D fix, then coordinates are considered invalid 
-            latLonFlags |= (1 << 0); // Bit 0: Invalid Latitude, Longitude, WGS Altitude, and MSL Altitude
-        }
-        writeLittleEndian(payload, kPayloadOffsetLatLonFlags, latLonFlags);
-
-        // Offset 67: Battery status (1 byte) - report 100% to avoid low battery warnings
-        writeLittleEndian(payload, kPayloadOffsetBatteryStatus, kReportedBatteryPercent);
-
-        writeLittleEndian(payload, kPayloadOffsetAccelX, gX);
-        writeLittleEndian(payload, kPayloadOffsetAccelY, gY);
-        writeLittleEndian(payload, kPayloadOffsetAccelZ, gZ);
-        writeLittleEndian(payload, kPayloadOffsetGyroX, rX);
-        writeLittleEndian(payload, kPayloadOffsetGyroY, rY);
-        writeLittleEndian(payload, kPayloadOffsetGyroZ, rZ);
-
-        // Wrap in UBX (standard RaceBox header and checksum)
-        memcpy(packet + kPacketPayloadOffset, payload, kRaceBoxPayloadSize);
-        uint8_t ckA, ckB; 
-        calculateChecksum(payload, kRaceBoxPayloadSize, kRaceBoxMessageClass, kRaceBoxMessageId, &ckA, &ckB);
-        packet[kPacketChecksumOffset] = ckA;
-        packet[kPacketChecksumOffset + 1] = ckB;
-
-        pCharacteristicTx->setValue(packet, kRaceBoxPacketSize);
-        pCharacteristicTx->notify();
-      }
-    }
-
-    // Report packet send rate
-    if ((now - lastGpsRateCheckTime) >= kGpsRateReportIntervalMs) {
-      const float bleRate = gpsUpdateCount / kGpsRateReportIntervalSeconds;
-      const float gnssRate = gnssUpdateCount / kGpsRateReportIntervalSeconds;
-      // Additional satellite info for debugging: number of satellites, fix type, horizontal accuracy, and lat/lon
-      uint8_t sats = 0;
-      uint8_t fix = 0;
-      uint32_t hAcc = 0;
-      double lat = 0.0, lon = 0.0;
-      if (navPvtPacket != NULL) {
-        const auto &navData = navPvtPacket->data;
-        sats = navData.numSV;
-        fix = navData.fixType;
-        hAcc = navData.hAcc;
-        lat = navData.lat * kLatLonToDegrees;
-        lon = navData.lon * kLatLonToDegrees;
-      }
-      Serial.printf("BLE Packet Rate: %.2f Hz | GNSS Update Rate: %.2f Hz | SVs: %u | Fix: %u | HAcc: %u mm | Lat: %.7f Lon: %.7f\n",
-                    bleRate, gnssRate, sats, fix, hAcc, lat, lon);
-      gpsUpdateCount = 0;
-      gnssUpdateCount = 0;
-      lastGpsRateCheckTime = now;
-    }
-
-    if (!deviceConnected && oldDeviceConnected) {
-      delay(kRestartAdvertisingDelayMs);
-      if (pServer != NULL) {
-        pServer->startAdvertising();
-      }
-      oldDeviceConnected = deviceConnected;
-    }
-    if (deviceConnected && !oldDeviceConnected) {
-      oldDeviceConnected = deviceConnected;
-    }
-  }
+  gGnss.checkUblox();
+  updateFilteredImu(now);
+  updateConnectionLed(now);
+  processGnssData(now);
+  updateBleAdvertisingState();
 }
