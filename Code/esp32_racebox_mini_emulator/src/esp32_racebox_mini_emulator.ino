@@ -128,6 +128,7 @@ constexpr size_t kChecksumSize = 2U;
 constexpr size_t kPacketSize = kHeaderSize + kPayloadSize + kChecksumSize;
 constexpr size_t kPayloadOffset = kHeaderSize;
 constexpr size_t kChecksumOffset = kPayloadOffset + kPayloadSize;
+constexpr bool kReportedBatteryCharging = false;
 constexpr uint8_t kReportedBatteryPercent = 100U;
 
 namespace Offset {
@@ -740,12 +741,16 @@ uint8_t buildFixStatusFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   const auto &navData = navPvtPacket->data;
   uint8_t flags = 0U;
 
-  if (navData.fixType == 3U) {
+  if (navData.flags.bits.gnssFixOK) {
     flags |= (1U << 0U);
   }
-  if (gGnss.getHeadVehValid()) {
+  if (navData.flags.bits.diffSoln) {
+    flags |= (1U << 1U);
+  }
+  if (navData.flags.bits.headVehValid) {
     flags |= (1U << 5U);
   }
+  flags |= static_cast<uint8_t>(navData.flags.bits.carrSoln << 6U);
 
   return flags;
 }
@@ -754,13 +759,13 @@ uint8_t buildDateTimeFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   const auto &navData = navPvtPacket->data;
   uint8_t flags = 0U;
 
-  if (navData.valid.bits.validTime) {
+  if (navData.flags2.bits.confirmedAvai) {
     flags |= (1U << 5U);
   }
-  if (navData.valid.bits.validDate) {
+  if (navData.flags2.bits.confirmedDate) {
     flags |= (1U << 6U);
   }
-  if (navData.valid.bits.validTime && navData.valid.bits.fullyResolved) {
+  if (navData.flags2.bits.confirmedTime) {
     flags |= (1U << 7U);
   }
 
@@ -771,11 +776,22 @@ uint8_t buildLatLonFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   const auto &navData = navPvtPacket->data;
   uint8_t flags = 0U;
 
-  if (navData.fixType < 2U) {
+  if (navData.flags3.bits.invalidLlh) {
     flags |= (1U << 0U);
   }
 
   return flags;
+}
+
+uint8_t buildBatteryStatusByte() {
+  uint8_t batteryStatus =
+      InternalConstants::Protocol::kReportedBatteryPercent & 0x7FU;
+
+  if (InternalConstants::Protocol::kReportedBatteryCharging) {
+    batteryStatus |= 0x80U;
+  }
+
+  return batteryStatus;
 }
 
 void populateRaceBoxPayload(const UBX_NAV_PVT_t *navPvtPacket) {
@@ -849,7 +865,7 @@ void populateRaceBoxPayload(const UBX_NAV_PVT_t *navPvtPacket) {
                     buildLatLonFlags(navPvtPacket));
   writeLittleEndian(gTxPayloadBuffer,
                     InternalConstants::Protocol::Offset::kBatteryStatus,
-                    InternalConstants::Protocol::kReportedBatteryPercent);
+                    buildBatteryStatusByte());
 
   writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kAccelX,
                     imuSample.accelX);

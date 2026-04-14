@@ -308,18 +308,21 @@ void sendRaceboxPacket() {
 
   // Fix and Info Flags
   uint8_t fixFlags = 0;
-  if (data->fixType == 3)
+  if (data->flags.bits.gnssFixOK)
     fixFlags |= (1 << 0);
-  if (myGNSS.getHeadVehValid())
+  if (data->flags.bits.diffSoln)
+    fixFlags |= (1 << 1);
+  if (data->flags.bits.headVehValid)
     fixFlags |= (1 << 5);
+  fixFlags |= (uint8_t)(data->flags.bits.carrSoln << 6);
   writeLittleEndian(payload, 21, fixFlags);
 
   uint8_t dtFlags = 0;
-  if (data->valid.bits.validTime)
+  if (data->flags2.bits.confirmedAvai)
     dtFlags |= (1 << 5);
-  if (data->valid.bits.validDate)
+  if (data->flags2.bits.confirmedDate)
     dtFlags |= (1 << 6);
-  if (data->valid.bits.validTime && data->valid.bits.fullyResolved)
+  if (data->flags2.bits.confirmedTime)
     dtFlags |= (1 << 7);
   writeLittleEndian(payload, 22, dtFlags);
 
@@ -338,7 +341,7 @@ void sendRaceboxPacket() {
   writeLittleEndian(payload, 64, (uint16_t)data->pDOP);
 
   // Fix Quality and Misc
-  if (data->fixType < 2)
+  if (data->flags3.bits.invalidLlh)
     writeLittleEndian(payload, 66, (uint8_t)(1 << 0));
 
   uint8_t batPct = currentBatteryPercentage & 0x7F;
