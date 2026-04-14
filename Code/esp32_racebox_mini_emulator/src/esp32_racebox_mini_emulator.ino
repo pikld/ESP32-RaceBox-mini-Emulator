@@ -6,6 +6,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -99,6 +100,15 @@ constexpr char kFirmwareCharacteristic[] = "00002a26-0000-1000-8000-00805f9b34fb
 constexpr char kHardwareCharacteristic[] = "00002a27-0000-1000-8000-00805f9b34fb";
 constexpr char kManufacturerCharacteristic[] = "00002a29-0000-1000-8000-00805f9b34fb";
 }  // namespace BleUuids
+
+namespace BleTransport {
+constexpr uint16_t kDefaultPeerMtu = 23U;
+constexpr size_t kNotificationOverhead = 3U;
+constexpr size_t kFallbackNotificationPayload =
+    kDefaultPeerMtu - kNotificationOverhead;
+constexpr size_t kMinimumUbxFrameSize = 8U;
+constexpr size_t kMaxUbxFrameSize = 1024U;
+}  // namespace BleTransport
 
 namespace Timing {
 constexpr uint32_t kRateReportIntervalMs = 5000UL;
@@ -242,12 +252,19 @@ struct EncodedImuSample {
   int16_t gyroZ = 0;
 };
 
+struct UbxFrameAssembler {
+  std::array<uint8_t, InternalConstants::BleTransport::kMaxUbxFrameSize> buffer = {};
+  size_t length = 0U;
+  size_t expectedLength = 0U;
+};
+
 SFE_UBLOX_GNSS gGnss;
 HardwareSerial gGpsSerial(2);
 Adafruit_MPU6050 gMpu;
 
 RuntimeState gState;
 BleHandles gBle;
+UbxFrameAssembler gRaceBoxRxAssembler;
 
 std::array<uint8_t, InternalConstants::Protocol::kPayloadSize> gTxPayloadBuffer = {};
 std::array<uint8_t, InternalConstants::Protocol::kPacketSize> gTxPacketBuffer = {{
@@ -262,6 +279,9 @@ std::array<uint8_t, InternalConstants::Protocol::kPacketSize> gTxPacketBuffer = 
 // ============================================================================
 // BLE Callbacks
 // ============================================================================
+void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
+                              size_t length);
+
 class RaceBoxServerCallbacks : public BLEServerCallbacks {
  public:
   void onConnect(BLEServer *server) override {
@@ -297,11 +317,7 @@ class RaceBoxRxCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    Serial.print("Received BLE command: ");
-    for (size_t i = 0; i < rxLength; ++i) {
-      Serial.printf("0x%02X ", rxValue[i]);
-    }
-    Serial.println();
+    consumeUbxTransportBytes(gRaceBoxRxAssembler, rxValue, rxLength);
   }
 };
 
@@ -341,6 +357,107 @@ void writeLittleEndian(std::array<uint8_t, kBufferSize> &buffer, size_t offset,
   memcpy(buffer.data() + offset, &value, sizeof(TValue));
 }
 
+void resetUbxFrameAssembler(UbxFrameAssembler &assembler) {
+  assembler.length = 0U;
+  assembler.expectedLength = 0U;
+}
+
+size_t getExpectedUbxFrameLength(const UbxFrameAssembler &assembler) {
+  if (assembler.length < InternalConstants::Protocol::kHeaderSize) {
+    return 0U;
+  }
+
+  if ((assembler.buffer[0] != InternalConstants::Protocol::kUbxSyncChar1) ||
+      (assembler.buffer[1] != InternalConstants::Protocol::kUbxSyncChar2)) {
+    return 0U;
+  }
+
+  const uint16_t payloadLength =
+      static_cast<uint16_t>(assembler.buffer[4]) |
+      (static_cast<uint16_t>(assembler.buffer[5]) << 8U);
+  const size_t frameLength = InternalConstants::Protocol::kHeaderSize +
+                             static_cast<size_t>(payloadLength) +
+                             InternalConstants::Protocol::kChecksumSize;
+
+  if ((frameLength < InternalConstants::BleTransport::kMinimumUbxFrameSize) ||
+      (frameLength > InternalConstants::BleTransport::kMaxUbxFrameSize)) {
+    return 0U;
+  }
+
+  return frameLength;
+}
+
+void handleReassembledRaceBoxFrame(const uint8_t *frame, size_t length) {
+  if ((frame == nullptr) || (length == 0U)) {
+    return;
+  }
+
+  Serial.printf("Reassembled BLE RX frame (%u bytes): ",
+                static_cast<unsigned int>(length));
+  for (size_t i = 0; i < length; ++i) {
+    Serial.printf("0x%02X ", frame[i]);
+  }
+  Serial.println();
+}
+
+void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
+                              size_t length) {
+  if ((data == nullptr) || (length == 0U)) {
+    return;
+  }
+
+  for (size_t index = 0U; index < length; ++index) {
+    const uint8_t byte = data[index];
+
+    if (assembler.length == 0U) {
+      if (byte == InternalConstants::Protocol::kUbxSyncChar1) {
+        assembler.buffer[0] = byte;
+        assembler.length = 1U;
+      }
+      continue;
+    }
+
+    if (assembler.length == 1U) {
+      if (byte == InternalConstants::Protocol::kUbxSyncChar2) {
+        assembler.buffer[assembler.length++] = byte;
+      } else if (byte == InternalConstants::Protocol::kUbxSyncChar1) {
+        assembler.buffer[0] = byte;
+        assembler.length = 1U;
+      } else {
+        resetUbxFrameAssembler(assembler);
+      }
+      continue;
+    }
+
+    if (assembler.length >= assembler.buffer.size()) {
+      Serial.println("Dropping BLE RX frame because it exceeded the assembler buffer.");
+      resetUbxFrameAssembler(assembler);
+      if (byte == InternalConstants::Protocol::kUbxSyncChar1) {
+        assembler.buffer[0] = byte;
+        assembler.length = 1U;
+      }
+      continue;
+    }
+
+    assembler.buffer[assembler.length++] = byte;
+
+    if (assembler.length == InternalConstants::Protocol::kHeaderSize) {
+      assembler.expectedLength = getExpectedUbxFrameLength(assembler);
+      if (assembler.expectedLength == 0U) {
+        Serial.println("Dropping BLE RX frame with an invalid UBX header.");
+        resetUbxFrameAssembler(assembler);
+      }
+      continue;
+    }
+
+    if ((assembler.expectedLength != 0U) &&
+        (assembler.length == assembler.expectedLength)) {
+      handleReassembledRaceBoxFrame(assembler.buffer.data(), assembler.length);
+      resetUbxFrameAssembler(assembler);
+    }
+  }
+}
+
 void calculateUbxChecksum(const uint8_t *payload, uint16_t payloadLength,
                           uint8_t messageClass, uint8_t messageId, uint8_t *ckA,
                           uint8_t *ckB) {
@@ -376,6 +493,46 @@ int16_t saturatingFloatToInt16(float value) {
   }
 
   return static_cast<int16_t>(value);
+}
+
+size_t getBleNotifyPayloadLimit() {
+  if ((gBle.server == nullptr) || !gState.deviceConnected) {
+    return InternalConstants::BleTransport::kFallbackNotificationPayload;
+  }
+
+  const uint16_t connId = gBle.server->getConnId();
+  uint16_t mtu = gBle.server->getPeerMTU(connId);
+  if (mtu <= InternalConstants::BleTransport::kNotificationOverhead) {
+    mtu = InternalConstants::BleTransport::kDefaultPeerMtu;
+  }
+
+  return static_cast<size_t>(mtu) - InternalConstants::BleTransport::kNotificationOverhead;
+}
+
+bool notifyCharacteristicValue(BLECharacteristic *characteristic, const uint8_t *data,
+                               size_t length, bool allowChunking) {
+  if ((characteristic == nullptr) || (data == nullptr) || (length == 0U)) {
+    return false;
+  }
+
+  const size_t payloadLimit = getBleNotifyPayloadLimit();
+  if (!allowChunking && (length > payloadLimit)) {
+    Serial.printf(
+        "Skipping BLE notify because %u bytes exceeds the current ATT payload limit of %u bytes.\n",
+        static_cast<unsigned int>(length), static_cast<unsigned int>(payloadLimit));
+    return false;
+  }
+
+  size_t offset = 0U;
+  while (offset < length) {
+    const size_t remaining = length - offset;
+    const size_t chunkLength = allowChunking ? std::min(remaining, payloadLimit) : remaining;
+    characteristic->setValue(const_cast<uint8_t *>(data + offset), chunkLength);
+    characteristic->notify();
+    offset += chunkLength;
+  }
+
+  return true;
 }
 
 // ============================================================================
@@ -904,9 +1061,10 @@ void sendRaceBoxPacket(const UBX_NAV_PVT_t *navPvtPacket) {
   populateRaceBoxPayload(navPvtPacket);
   finalizeRaceBoxPacket();
 
-  gBle.tx->setValue(gTxPacketBuffer.data(), InternalConstants::Protocol::kPacketSize);
-  gBle.tx->notify();
-  gState.counters.blePacketCount++;
+  if (notifyCharacteristicValue(gBle.tx, gTxPacketBuffer.data(),
+                                InternalConstants::Protocol::kPacketSize, true)) {
+    gState.counters.blePacketCount++;
+  }
 }
 
 // ============================================================================
