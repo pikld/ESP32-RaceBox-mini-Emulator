@@ -117,6 +117,8 @@ constexpr float kRateReportIntervalSeconds =
 constexpr uint32_t kDisconnectedBlinkIntervalMs = 500UL;
 constexpr uint32_t kRestartAdvertisingDelayMs = 500UL;
 constexpr uint32_t kGnssSerialRxBufferSize = 512UL;
+constexpr uint32_t kUbxPassthroughOverallTimeoutMs = 250UL;
+constexpr uint32_t kUbxPassthroughIdleTimeoutMs = 40UL;
 constexpr uint32_t kHaltLoopDelayMs = 100UL;
 }  // namespace Timing
 
@@ -135,6 +137,8 @@ constexpr uint8_t kMessageId = 0x01U;
 constexpr uint8_t kAckMessageId = 0x02U;
 constexpr uint8_t kNackMessageId = 0x03U;
 constexpr uint8_t kGnssConfigurationMessageId = 0x27U;
+constexpr uint8_t kUbxNavClass = UBX_CLASS_NAV;
+constexpr uint8_t kUbxNavPvtMessageId = UBX_NAV_PVT;
 constexpr size_t kHeaderSize = 6U;
 constexpr size_t kPayloadSize = 80U;
 constexpr size_t kChecksumSize = 2U;
@@ -215,6 +219,8 @@ static_assert(
     InternalConstants::Protocol::Offset::kGyroZ + sizeof(int16_t) ==
         InternalConstants::Protocol::kPayloadSize,
     "Payload layout no longer ends at gyro Z.");
+static_assert(sizeof(UBX_NAV_PVT_data_t) == UBX_NAV_PVT_LEN,
+              "Unexpected UBX-NAV-PVT payload size.");
 
 // ============================================================================
 // Runtime State
@@ -255,8 +261,12 @@ struct RuntimeState {
   RuntimeCounters counters{};
   RuntimeTimers timers{};
   RaceBoxGnssConfiguration gnssConfiguration{};
+  bool latestNavPvtValid = false;
+  bool ubxPassthroughActive = false;
   bool deviceConnected = false;
   bool previousDeviceConnected = false;
+  unsigned long ubxPassthroughStartedMs = 0UL;
+  unsigned long ubxPassthroughLastRxMs = 0UL;
   uint32_t lastITow = 0U;
 };
 
@@ -290,6 +300,8 @@ Adafruit_MPU6050 gMpu;
 RuntimeState gState;
 BleHandles gBle;
 UbxFrameAssembler gRaceBoxRxAssembler;
+UbxFrameAssembler gGnssRxAssembler;
+UBX_NAV_PVT_t gLatestNavPvtPacket = {};
 
 std::array<uint8_t, InternalConstants::Protocol::kPayloadSize> gTxPayloadBuffer = {};
 std::array<uint8_t, InternalConstants::Protocol::kPacketSize> gTxPacketBuffer = {{
@@ -305,8 +317,13 @@ std::array<uint8_t, InternalConstants::Protocol::kPacketSize> gTxPacketBuffer = 
 // BLE Callbacks
 // ============================================================================
 void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
-                              size_t length);
+                              size_t length,
+                              void (*frameHandler)(const uint8_t *frame, size_t length));
 void dispatchReceivedUbxFrame(const uint8_t *frame, size_t length);
+void handleReassembledRaceBoxFrame(const uint8_t *frame, size_t length);
+void handleGnssUbxFrame(const uint8_t *frame, size_t length);
+bool isNewNavigationEpoch(const UBX_NAV_PVT_t *navPvtPacket);
+void sendRaceBoxPacket(const UBX_NAV_PVT_t *navPvtPacket);
 
 class RaceBoxServerCallbacks : public BLEServerCallbacks {
  public:
@@ -343,7 +360,8 @@ class RaceBoxRxCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    consumeUbxTransportBytes(gRaceBoxRxAssembler, rxValue, rxLength);
+    consumeUbxTransportBytes(gRaceBoxRxAssembler, rxValue, rxLength,
+                             handleReassembledRaceBoxFrame);
   }
 };
 
@@ -429,7 +447,8 @@ void handleReassembledRaceBoxFrame(const uint8_t *frame, size_t length) {
 }
 
 void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
-                              size_t length) {
+                              size_t length,
+                              void (*frameHandler)(const uint8_t *frame, size_t length)) {
   if ((data == nullptr) || (length == 0U)) {
     return;
   }
@@ -480,7 +499,9 @@ void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
 
     if ((assembler.expectedLength != 0U) &&
         (assembler.length == assembler.expectedLength)) {
-      handleReassembledRaceBoxFrame(assembler.buffer.data(), assembler.length);
+      if (frameHandler != nullptr) {
+        frameHandler(assembler.buffer.data(), assembler.length);
+      }
       resetUbxFrameAssembler(assembler);
     }
   }
@@ -960,6 +981,125 @@ void handleGnssConfigurationCommand(const uint8_t *payload, size_t payloadLength
   sendRaceBoxAckNack(false, InternalConstants::Protocol::kGnssConfigurationMessageId);
 }
 
+void cacheLatestNavPvt(const uint8_t *payload, size_t payloadLength) {
+  if ((payload == nullptr) || (payloadLength != UBX_NAV_PVT_LEN)) {
+    return;
+  }
+
+  memcpy(&gLatestNavPvtPacket.data, payload, sizeof(gLatestNavPvtPacket.data));
+  gState.latestNavPvtValid = true;
+
+  if (isNewNavigationEpoch(&gLatestNavPvtPacket)) {
+    gState.counters.gnssUpdateCount++;
+    sendRaceBoxPacket(&gLatestNavPvtPacket);
+  }
+}
+
+void handleGnssUbxFrame(const uint8_t *frame, size_t length) {
+  if (!isValidUbxFrame(frame, length)) {
+    Serial.println("Dropping GNSS UART frame with an invalid checksum.");
+    return;
+  }
+
+  const uint8_t messageClass = frame[2];
+  const uint8_t messageId = frame[3];
+  const uint16_t payloadLength =
+      static_cast<uint16_t>(frame[4]) |
+      (static_cast<uint16_t>(frame[5]) << 8U);
+  const uint8_t *payload = frame + InternalConstants::Protocol::kHeaderSize;
+
+  if ((messageClass == InternalConstants::Protocol::kUbxNavClass) &&
+      (messageId == InternalConstants::Protocol::kUbxNavPvtMessageId) &&
+      (payloadLength == UBX_NAV_PVT_LEN)) {
+    cacheLatestNavPvt(payload, payloadLength);
+    return;
+  }
+
+  if (!notifyCharacteristicValue(gBle.tx, frame, length, true)) {
+    Serial.printf("Failed to forward UBX response 0x%02X 0x%02X over BLE.\n",
+                  static_cast<unsigned int>(messageClass),
+                  static_cast<unsigned int>(messageId));
+  }
+}
+
+bool startUbxPassthroughRequest(const uint8_t *frame, size_t length) {
+  if ((frame == nullptr) || (length == 0U)) {
+    return false;
+  }
+
+  if (gState.ubxPassthroughActive) {
+    Serial.println("Ignoring UBX request because a pass-through exchange is already active.");
+    return false;
+  }
+
+  while (gGpsSerial.available() > 0) {
+    const int incoming = gGpsSerial.read();
+    if (incoming < 0) {
+      break;
+    }
+
+    const uint8_t byte = static_cast<uint8_t>(incoming);
+    consumeUbxTransportBytes(gGnssRxAssembler, &byte, 1U, handleGnssUbxFrame);
+  }
+
+  resetUbxFrameAssembler(gGnssRxAssembler);
+
+  const size_t bytesWritten = gGpsSerial.write(frame, length);
+  gGpsSerial.flush();
+  if (bytesWritten != length) {
+    Serial.printf("Failed to forward the full UBX request to GNSS UART (%u/%u bytes).\n",
+                  static_cast<unsigned int>(bytesWritten),
+                  static_cast<unsigned int>(length));
+    return false;
+  }
+
+  gState.ubxPassthroughActive = true;
+  gState.ubxPassthroughStartedMs = millis();
+  gState.ubxPassthroughLastRxMs = gState.ubxPassthroughStartedMs;
+  return true;
+}
+
+void finishUbxPassthrough() {
+  gState.ubxPassthroughActive = false;
+  gState.ubxPassthroughStartedMs = 0UL;
+  gState.ubxPassthroughLastRxMs = 0UL;
+  resetUbxFrameAssembler(gGnssRxAssembler);
+}
+
+void processActiveUbxPassthrough(unsigned long now) {
+  while (gGpsSerial.available() > 0) {
+    const int incoming = gGpsSerial.read();
+    if (incoming < 0) {
+      break;
+    }
+
+    const uint8_t byte = static_cast<uint8_t>(incoming);
+    gState.ubxPassthroughLastRxMs = millis();
+    consumeUbxTransportBytes(gGnssRxAssembler, &byte, 1U, handleGnssUbxFrame);
+  }
+
+  if (!gState.ubxPassthroughActive) {
+    return;
+  }
+
+  const unsigned long elapsed = now - gState.ubxPassthroughStartedMs;
+  const unsigned long idle = now - gState.ubxPassthroughLastRxMs;
+  if ((elapsed >= InternalConstants::Timing::kUbxPassthroughOverallTimeoutMs) ||
+      (idle >= InternalConstants::Timing::kUbxPassthroughIdleTimeoutMs)) {
+    finishUbxPassthrough();
+  }
+}
+
+bool refreshLatestNavPvtFromLibrary() {
+  if (!gGnss.getPVT() || (gGnss.packetUBXNAVPVT == nullptr)) {
+    return false;
+  }
+
+  gLatestNavPvtPacket.data = gGnss.packetUBXNAVPVT->data;
+  gState.latestNavPvtValid = true;
+  return true;
+}
+
 void dispatchReceivedUbxFrame(const uint8_t *frame, size_t length) {
   if (!isValidUbxFrame(frame, length)) {
     Serial.println("Dropping BLE RX frame with an invalid checksum.");
@@ -974,10 +1114,7 @@ void dispatchReceivedUbxFrame(const uint8_t *frame, size_t length) {
   const uint8_t *payload = frame + InternalConstants::Protocol::kHeaderSize;
 
   if (messageClass != InternalConstants::Protocol::kMessageClass) {
-    Serial.printf(
-        "Ignoring UBX command 0x%02X 0x%02X until generic pass-through is implemented.\n",
-        static_cast<unsigned int>(messageClass),
-        static_cast<unsigned int>(messageId));
+    startUbxPassthroughRequest(frame, length);
     return;
   }
 
@@ -1408,13 +1545,12 @@ void updateBleAdvertisingState() {
 }
 
 void processGnssData(unsigned long now) {
-  if (!gGnss.getPVT()) {
-    return;
-  }
+  const bool receivedFreshNavPvt =
+      !gState.ubxPassthroughActive && refreshLatestNavPvtFromLibrary();
+  const UBX_NAV_PVT_t *navPvtPacket =
+      gState.latestNavPvtValid ? &gLatestNavPvtPacket : nullptr;
 
-  const UBX_NAV_PVT_t *navPvtPacket = gGnss.packetUBXNAVPVT;
-
-  if (isNewNavigationEpoch(navPvtPacket)) {
+  if (receivedFreshNavPvt && isNewNavigationEpoch(navPvtPacket)) {
     gState.counters.gnssUpdateCount++;
     sendRaceBoxPacket(navPvtPacket);
   }
@@ -1440,7 +1576,11 @@ void setup() {
 void loop() {
   const unsigned long now = millis();
 
-  gGnss.checkUblox();
+  if (gState.ubxPassthroughActive) {
+    processActiveUbxPassthrough(now);
+  } else {
+    gGnss.checkUblox();
+  }
   updateFilteredImu(now);
   updateConnectionLed(now);
   processGnssData(now);
