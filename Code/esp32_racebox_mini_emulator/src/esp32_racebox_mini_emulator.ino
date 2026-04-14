@@ -138,6 +138,7 @@ constexpr uint8_t kAckMessageId = 0x02U;
 constexpr uint8_t kNackMessageId = 0x03U;
 constexpr uint8_t kGnssConfigurationMessageId = 0x27U;
 constexpr uint8_t kUbxNavClass = UBX_CLASS_NAV;
+constexpr uint8_t kUbxNavDopMessageId = UBX_NAV_DOP;
 constexpr uint8_t kUbxNavPvtMessageId = UBX_NAV_PVT;
 constexpr size_t kHeaderSize = 6U;
 constexpr size_t kPayloadSize = 80U;
@@ -261,6 +262,7 @@ struct RuntimeState {
   RuntimeCounters counters{};
   RuntimeTimers timers{};
   RaceBoxGnssConfiguration gnssConfiguration{};
+  bool latestNavDopValid = false;
   bool latestNavPvtValid = false;
   bool ubxPassthroughActive = false;
   bool deviceConnected = false;
@@ -301,6 +303,7 @@ RuntimeState gState;
 BleHandles gBle;
 UbxFrameAssembler gRaceBoxRxAssembler;
 UbxFrameAssembler gGnssRxAssembler;
+UBX_NAV_DOP_t gLatestNavDopPacket = {};
 UBX_NAV_PVT_t gLatestNavPvtPacket = {};
 
 std::array<uint8_t, InternalConstants::Protocol::kPayloadSize> gTxPayloadBuffer = {};
@@ -322,6 +325,7 @@ void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
 void dispatchReceivedUbxFrame(const uint8_t *frame, size_t length);
 void handleReassembledRaceBoxFrame(const uint8_t *frame, size_t length);
 void handleGnssUbxFrame(const uint8_t *frame, size_t length);
+void handleNewNavigationEpoch(const UBX_NAV_PVT_t *navPvtPacket);
 bool isNewNavigationEpoch(const UBX_NAV_PVT_t *navPvtPacket);
 void sendRaceBoxPacket(const UBX_NAV_PVT_t *navPvtPacket);
 
@@ -399,6 +403,18 @@ template <typename TValue, size_t kBufferSize>
 void writeLittleEndian(std::array<uint8_t, kBufferSize> &buffer, size_t offset,
                        TValue value) {
   memcpy(buffer.data() + offset, &value, sizeof(TValue));
+}
+
+uint16_t readUint16LittleEndian(const uint8_t *buffer, size_t offset) {
+  uint16_t value = 0U;
+  memcpy(&value, buffer + offset, sizeof(value));
+  return value;
+}
+
+uint32_t readUint32LittleEndian(const uint8_t *buffer, size_t offset) {
+  uint32_t value = 0U;
+  memcpy(&value, buffer + offset, sizeof(value));
+  return value;
 }
 
 void resetUbxFrameAssembler(UbxFrameAssembler &assembler) {
@@ -871,6 +887,9 @@ void initializeGnssOrHalt() {
 
   configureGnssUartOutput();
   gGnss.setAutoPVT(true);
+  if (!gGnss.setAutoDOP(true)) {
+    Serial.println("Failed to enable automatic GNSS DOP reports.");
+  }
   if (!gGnss.setDynamicModel(
           static_cast<dynModel>(gState.gnssConfiguration.dynamicPlatformModel))) {
     Serial.println("Failed to apply the configured GNSS dynamic platform model.");
@@ -981,6 +1000,22 @@ void handleGnssConfigurationCommand(const uint8_t *payload, size_t payloadLength
   sendRaceBoxAckNack(false, InternalConstants::Protocol::kGnssConfigurationMessageId);
 }
 
+void cacheLatestNavDop(const uint8_t *payload, size_t payloadLength) {
+  if ((payload == nullptr) || (payloadLength != UBX_NAV_DOP_LEN)) {
+    return;
+  }
+
+  gLatestNavDopPacket.data.iTOW = readUint32LittleEndian(payload, 0U);
+  gLatestNavDopPacket.data.gDOP = readUint16LittleEndian(payload, 4U);
+  gLatestNavDopPacket.data.pDOP = readUint16LittleEndian(payload, 6U);
+  gLatestNavDopPacket.data.tDOP = readUint16LittleEndian(payload, 8U);
+  gLatestNavDopPacket.data.vDOP = readUint16LittleEndian(payload, 10U);
+  gLatestNavDopPacket.data.hDOP = readUint16LittleEndian(payload, 12U);
+  gLatestNavDopPacket.data.nDOP = readUint16LittleEndian(payload, 14U);
+  gLatestNavDopPacket.data.eDOP = readUint16LittleEndian(payload, 16U);
+  gState.latestNavDopValid = true;
+}
+
 void cacheLatestNavPvt(const uint8_t *payload, size_t payloadLength) {
   if ((payload == nullptr) || (payloadLength != UBX_NAV_PVT_LEN)) {
     return;
@@ -990,8 +1025,7 @@ void cacheLatestNavPvt(const uint8_t *payload, size_t payloadLength) {
   gState.latestNavPvtValid = true;
 
   if (isNewNavigationEpoch(&gLatestNavPvtPacket)) {
-    gState.counters.gnssUpdateCount++;
-    sendRaceBoxPacket(&gLatestNavPvtPacket);
+    handleNewNavigationEpoch(&gLatestNavPvtPacket);
   }
 }
 
@@ -1007,6 +1041,13 @@ void handleGnssUbxFrame(const uint8_t *frame, size_t length) {
       static_cast<uint16_t>(frame[4]) |
       (static_cast<uint16_t>(frame[5]) << 8U);
   const uint8_t *payload = frame + InternalConstants::Protocol::kHeaderSize;
+
+  if ((messageClass == InternalConstants::Protocol::kUbxNavClass) &&
+      (messageId == InternalConstants::Protocol::kUbxNavDopMessageId) &&
+      (payloadLength == UBX_NAV_DOP_LEN)) {
+    cacheLatestNavDop(payload, payloadLength);
+    return;
+  }
 
   if ((messageClass == InternalConstants::Protocol::kUbxNavClass) &&
       (messageId == InternalConstants::Protocol::kUbxNavPvtMessageId) &&
@@ -1097,6 +1138,16 @@ bool refreshLatestNavPvtFromLibrary() {
 
   gLatestNavPvtPacket.data = gGnss.packetUBXNAVPVT->data;
   gState.latestNavPvtValid = true;
+  return true;
+}
+
+bool refreshLatestNavDopFromLibrary() {
+  if (!gGnss.getDOP() || (gGnss.packetUBXNAVDOP == nullptr)) {
+    return false;
+  }
+
+  gLatestNavDopPacket.data = gGnss.packetUBXNAVDOP->data;
+  gState.latestNavDopValid = true;
   return true;
 }
 
@@ -1460,6 +1511,223 @@ void sendRaceBoxPacket(const UBX_NAV_PVT_t *navPvtPacket) {
 }
 
 // ============================================================================
+// NMEA Output
+// ============================================================================
+void formatNmeaTime(const UBX_NAV_PVT_t *navPvtPacket, char *buffer, size_t bufferSize) {
+  const auto &navData = navPvtPacket->data;
+  int second = navData.sec;
+  int centiseconds = 0;
+
+  if (navData.nano > 0) {
+    centiseconds = static_cast<int>((navData.nano + 5000000L) / 10000000L);
+    if (centiseconds >= 100) {
+      centiseconds = 99;
+    }
+  }
+
+  snprintf(buffer, bufferSize, "%02u%02u%02d.%02d", navData.hour, navData.min,
+           second, centiseconds);
+}
+
+void formatNmeaDate(const UBX_NAV_PVT_t *navPvtPacket, char *buffer, size_t bufferSize) {
+  const auto &navData = navPvtPacket->data;
+  snprintf(buffer, bufferSize, "%02u%02u%02u", navData.day, navData.month,
+           static_cast<unsigned int>(navData.year % 100U));
+}
+
+void formatNmeaCoordinate(int32_t scaledDegrees, bool isLatitude, char *valueBuffer,
+                          size_t valueBufferSize, char *hemisphereBuffer,
+                          size_t hemisphereBufferSize) {
+  if ((valueBuffer == nullptr) || (hemisphereBuffer == nullptr) ||
+      (valueBufferSize == 0U) || (hemisphereBufferSize == 0U)) {
+    return;
+  }
+
+  const double decimalDegrees =
+      std::fabs(static_cast<double>(scaledDegrees) *
+                InternalConstants::Conversion::kLatLonToDegrees);
+  const int degrees = static_cast<int>(decimalDegrees);
+  const double minutes = (decimalDegrees - static_cast<double>(degrees)) * 60.0;
+  const int degreeWidth = isLatitude ? 2 : 3;
+
+  snprintf(valueBuffer, valueBufferSize, "%0*d%08.5f", degreeWidth, degrees, minutes);
+  snprintf(hemisphereBuffer, hemisphereBufferSize, "%c",
+           isLatitude ? (scaledDegrees >= 0 ? 'N' : 'S')
+                      : (scaledDegrees >= 0 ? 'E' : 'W'));
+}
+
+void formatOptionalDop(bool available, uint16_t dopTimes100, char *buffer,
+                       size_t bufferSize) {
+  if ((buffer == nullptr) || (bufferSize == 0U)) {
+    return;
+  }
+
+  if (!available) {
+    buffer[0] = '\0';
+    return;
+  }
+
+  snprintf(buffer, bufferSize, "%.2f", static_cast<float>(dopTimes100) / 100.0f);
+}
+
+char getNmeaModeIndicator(const UBX_NAV_PVT_t *navPvtPacket) {
+  const auto &navData = navPvtPacket->data;
+  if (!isReportedFixValid(navPvtPacket)) {
+    return 'N';
+  }
+
+  if (navData.flags.bits.carrSoln == 2U) {
+    return 'R';
+  }
+  if (navData.flags.bits.carrSoln == 1U) {
+    return 'F';
+  }
+  if (navData.flags.bits.diffSoln) {
+    return 'D';
+  }
+
+  return 'A';
+}
+
+uint8_t getNmeaFixQuality(const UBX_NAV_PVT_t *navPvtPacket) {
+  const auto &navData = navPvtPacket->data;
+  if (!isReportedFixValid(navPvtPacket)) {
+    return 0U;
+  }
+
+  if (navData.flags.bits.carrSoln == 2U) {
+    return 4U;
+  }
+  if (navData.flags.bits.carrSoln == 1U) {
+    return 5U;
+  }
+  if (navData.flags.bits.diffSoln) {
+    return 2U;
+  }
+
+  return 1U;
+}
+
+uint8_t getNmeaGsaFixType(const UBX_NAV_PVT_t *navPvtPacket) {
+  const uint8_t fixType = navPvtPacket->data.fixType;
+  if (fixType >= 3U) {
+    return 3U;
+  }
+  if (fixType == 2U) {
+    return 2U;
+  }
+  return 1U;
+}
+
+bool sendNmeaSentenceBody(const char *body) {
+  if ((body == nullptr) || !gState.deviceConnected || (gBle.nmeaTx == nullptr)) {
+    return false;
+  }
+
+  uint8_t checksum = 0U;
+  for (const char *cursor = body; *cursor != '\0'; ++cursor) {
+    checksum ^= static_cast<uint8_t>(*cursor);
+  }
+
+  char sentence[96] = {};
+  const int sentenceLength =
+      snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", body, checksum);
+  if ((sentenceLength <= 0) ||
+      (sentenceLength >= static_cast<int>(sizeof(sentence)))) {
+    return false;
+  }
+
+  return notifyCharacteristicValue(
+      gBle.nmeaTx, reinterpret_cast<const uint8_t *>(sentence),
+      static_cast<size_t>(sentenceLength), false);
+}
+
+void sendNmeaSentences(const UBX_NAV_PVT_t *navPvtPacket) {
+  if ((navPvtPacket == nullptr) || !gState.deviceConnected || (gBle.nmeaTx == nullptr)) {
+    return;
+  }
+
+  const auto &navData = navPvtPacket->data;
+  char timeField[16] = {};
+  char dateField[8] = {};
+  char latitudeField[16] = {};
+  char latitudeHemisphere[2] = {};
+  char longitudeField[16] = {};
+  char longitudeHemisphere[2] = {};
+  char pdopField[12] = {};
+  char hdopField[12] = {};
+  char vdopField[12] = {};
+  char altitudeField[16] = {};
+  char geoidField[16] = {};
+  char speedField[16] = {};
+  char courseField[16] = {};
+  char sentenceBody[96] = {};
+
+  formatNmeaTime(navPvtPacket, timeField, sizeof(timeField));
+  formatNmeaDate(navPvtPacket, dateField, sizeof(dateField));
+
+  if (!navData.flags3.bits.invalidLlh) {
+    formatNmeaCoordinate(navData.lat, true, latitudeField, sizeof(latitudeField),
+                         latitudeHemisphere, sizeof(latitudeHemisphere));
+    formatNmeaCoordinate(navData.lon, false, longitudeField, sizeof(longitudeField),
+                         longitudeHemisphere, sizeof(longitudeHemisphere));
+  }
+
+  const bool dopAvailable = gState.latestNavDopValid;
+  formatOptionalDop(true, dopAvailable ? gLatestNavDopPacket.data.pDOP : navData.pDOP,
+                    pdopField, sizeof(pdopField));
+  formatOptionalDop(dopAvailable, dopAvailable ? gLatestNavDopPacket.data.hDOP : 0U,
+                    hdopField, sizeof(hdopField));
+  formatOptionalDop(dopAvailable, dopAvailable ? gLatestNavDopPacket.data.vDOP : 0U,
+                    vdopField, sizeof(vdopField));
+
+  snprintf(altitudeField, sizeof(altitudeField), "%.3f",
+           static_cast<double>(navData.hMSL) / 1000.0);
+  snprintf(geoidField, sizeof(geoidField), "%.3f",
+           static_cast<double>(navData.height - navData.hMSL) / 1000.0);
+  snprintf(speedField, sizeof(speedField), "%.3f",
+           (static_cast<double>(navData.gSpeed) / 1000.0) * 1.9438444924406);
+  snprintf(courseField, sizeof(courseField), "%.2f",
+           static_cast<double>(navData.headMot) / 100000.0);
+
+  const char modeIndicator = getNmeaModeIndicator(navPvtPacket);
+  const char rmcStatus = isReportedFixValid(navPvtPacket) ? 'A' : 'V';
+
+  snprintf(sentenceBody, sizeof(sentenceBody),
+           "GNRMC,%s,%c,%s,%s,%s,%s,%s,%s,%s,,,%c", timeField, rmcStatus,
+           latitudeField, latitudeHemisphere, longitudeField, longitudeHemisphere,
+           speedField, courseField, dateField, modeIndicator);
+  sendNmeaSentenceBody(sentenceBody);
+
+  snprintf(sentenceBody, sizeof(sentenceBody),
+           "GNGNS,%s,%s,%s,%s,%s,%c,%u,%s,%s,%s,,", timeField, latitudeField,
+           latitudeHemisphere, longitudeField, longitudeHemisphere, modeIndicator,
+           static_cast<unsigned int>(navData.numSV), hdopField, altitudeField,
+           geoidField);
+  sendNmeaSentenceBody(sentenceBody);
+
+  snprintf(sentenceBody, sizeof(sentenceBody),
+           "GNGGA,%s,%s,%s,%s,%s,%u,%02u,%s,%s,M,%s,M,,", timeField, latitudeField,
+           latitudeHemisphere, longitudeField, longitudeHemisphere,
+           static_cast<unsigned int>(getNmeaFixQuality(navPvtPacket)),
+           static_cast<unsigned int>(navData.numSV), hdopField, altitudeField,
+           geoidField);
+  sendNmeaSentenceBody(sentenceBody);
+
+  snprintf(sentenceBody, sizeof(sentenceBody),
+           "GNGSA,A,%u,,,,,,,,,,,,,%s,%s,%s",
+           static_cast<unsigned int>(getNmeaGsaFixType(navPvtPacket)), pdopField,
+           hdopField, vdopField);
+  sendNmeaSentenceBody(sentenceBody);
+}
+
+void handleNewNavigationEpoch(const UBX_NAV_PVT_t *navPvtPacket) {
+  gState.counters.gnssUpdateCount++;
+  sendRaceBoxPacket(navPvtPacket);
+  sendNmeaSentences(navPvtPacket);
+}
+
+// ============================================================================
 // Loop Tasks
 // ============================================================================
 void updateConnectionLed(unsigned long now) {
@@ -1545,14 +1813,18 @@ void updateBleAdvertisingState() {
 }
 
 void processGnssData(unsigned long now) {
+  const bool receivedFreshGnssData = !gState.ubxPassthroughActive;
+  if (receivedFreshGnssData) {
+    refreshLatestNavDopFromLibrary();
+  }
+
   const bool receivedFreshNavPvt =
-      !gState.ubxPassthroughActive && refreshLatestNavPvtFromLibrary();
+      receivedFreshGnssData && refreshLatestNavPvtFromLibrary();
   const UBX_NAV_PVT_t *navPvtPacket =
       gState.latestNavPvtValid ? &gLatestNavPvtPacket : nullptr;
 
   if (receivedFreshNavPvt && isNewNavigationEpoch(navPvtPacket)) {
-    gState.counters.gnssUpdateCount++;
-    sendRaceBoxPacket(navPvtPacket);
+    handleNewNavigationEpoch(navPvtPacket);
   }
 
   reportRatesIfDue(now, navPvtPacket);
