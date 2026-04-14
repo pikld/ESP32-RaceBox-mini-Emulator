@@ -132,6 +132,9 @@ constexpr uint8_t kUbxSyncChar1 = 0xB5U;
 constexpr uint8_t kUbxSyncChar2 = 0x62U;
 constexpr uint8_t kMessageClass = 0xFFU;
 constexpr uint8_t kMessageId = 0x01U;
+constexpr uint8_t kAckMessageId = 0x02U;
+constexpr uint8_t kNackMessageId = 0x03U;
+constexpr uint8_t kGnssConfigurationMessageId = 0x27U;
 constexpr size_t kHeaderSize = 6U;
 constexpr size_t kPayloadSize = 80U;
 constexpr size_t kChecksumSize = 2U;
@@ -140,6 +143,17 @@ constexpr size_t kPayloadOffset = kHeaderSize;
 constexpr size_t kChecksumOffset = kPayloadOffset + kPayloadSize;
 constexpr bool kReportedBatteryCharging = false;
 constexpr uint8_t kReportedBatteryPercent = 100U;
+
+namespace GnssConfiguration {
+constexpr uint8_t kMinimumDynamicPlatformModel = 0U;
+constexpr uint8_t kMaximumDynamicPlatformModel = 8U;
+constexpr size_t kPayloadSize = 3U;
+constexpr uint8_t kDefaultDynamicPlatformModel =
+    static_cast<uint8_t>(DYN_MODEL_AUTOMOTIVE);
+constexpr bool kDefaultEnable3dSpeed = false;
+constexpr uint8_t kDefaultMinimumHorizontalAccuracyDecimeters = 30U;
+constexpr uint32_t kDecimeterToMillimeter = 100U;
+}  // namespace GnssConfiguration
 
 namespace Offset {
 constexpr size_t kITow = 0U;
@@ -225,11 +239,22 @@ struct RuntimeTimers {
   unsigned long lastRateReportMs = 0UL;
 };
 
+struct RaceBoxGnssConfiguration {
+  uint8_t dynamicPlatformModel =
+      InternalConstants::Protocol::GnssConfiguration::kDefaultDynamicPlatformModel;
+  bool enable3dSpeed =
+      InternalConstants::Protocol::GnssConfiguration::kDefaultEnable3dSpeed;
+  uint8_t minimumHorizontalAccuracyDecimeters =
+      InternalConstants::Protocol::GnssConfiguration::
+          kDefaultMinimumHorizontalAccuracyDecimeters;
+};
+
 struct RuntimeState {
   char deviceSerialNumber[InternalConstants::DeviceIdentity::kSerialDigits + 1U] = {};
   FilteredImuState filteredImu{};
   RuntimeCounters counters{};
   RuntimeTimers timers{};
+  RaceBoxGnssConfiguration gnssConfiguration{};
   bool deviceConnected = false;
   bool previousDeviceConnected = false;
   uint32_t lastITow = 0U;
@@ -281,6 +306,7 @@ std::array<uint8_t, InternalConstants::Protocol::kPacketSize> gTxPacketBuffer = 
 // ============================================================================
 void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
                               size_t length);
+void dispatchReceivedUbxFrame(const uint8_t *frame, size_t length);
 
 class RaceBoxServerCallbacks : public BLEServerCallbacks {
  public:
@@ -398,6 +424,8 @@ void handleReassembledRaceBoxFrame(const uint8_t *frame, size_t length) {
     Serial.printf("0x%02X ", frame[i]);
   }
   Serial.println();
+
+  dispatchReceivedUbxFrame(frame, length);
 }
 
 void consumeUbxTransportBytes(UbxFrameAssembler &assembler, const uint8_t *data,
@@ -533,6 +561,73 @@ bool notifyCharacteristicValue(BLECharacteristic *characteristic, const uint8_t 
   }
 
   return true;
+}
+
+bool isValidUbxFrame(const uint8_t *frame, size_t length) {
+  if ((frame == nullptr) ||
+      (length < InternalConstants::BleTransport::kMinimumUbxFrameSize)) {
+    return false;
+  }
+
+  if ((frame[0] != InternalConstants::Protocol::kUbxSyncChar1) ||
+      (frame[1] != InternalConstants::Protocol::kUbxSyncChar2)) {
+    return false;
+  }
+
+  const uint16_t payloadLength =
+      static_cast<uint16_t>(frame[4]) |
+      (static_cast<uint16_t>(frame[5]) << 8U);
+  const size_t expectedLength = InternalConstants::Protocol::kHeaderSize +
+                                static_cast<size_t>(payloadLength) +
+                                InternalConstants::Protocol::kChecksumSize;
+  if (expectedLength != length) {
+    return false;
+  }
+
+  uint8_t ckA = 0U;
+  uint8_t ckB = 0U;
+  calculateUbxChecksum(frame + InternalConstants::Protocol::kHeaderSize, payloadLength,
+                       frame[2], frame[3], &ckA, &ckB);
+  return (frame[length - 2U] == ckA) && (frame[length - 1U] == ckB);
+}
+
+bool sendUbxPacket(BLECharacteristic *characteristic, uint8_t messageClass,
+                   uint8_t messageId, const uint8_t *payload,
+                   size_t payloadLength, bool allowChunking) {
+  const size_t maxPayloadLength =
+      InternalConstants::BleTransport::kMaxUbxFrameSize -
+      InternalConstants::Protocol::kHeaderSize -
+      InternalConstants::Protocol::kChecksumSize;
+  if (payloadLength > maxPayloadLength) {
+    return false;
+  }
+
+  std::array<uint8_t, InternalConstants::BleTransport::kMaxUbxFrameSize> packet = {};
+  packet[0] = InternalConstants::Protocol::kUbxSyncChar1;
+  packet[1] = InternalConstants::Protocol::kUbxSyncChar2;
+  packet[2] = messageClass;
+  packet[3] = messageId;
+  packet[4] = static_cast<uint8_t>(payloadLength & 0xFFU);
+  packet[5] = static_cast<uint8_t>((payloadLength >> 8U) & 0xFFU);
+
+  if ((payload != nullptr) && (payloadLength > 0U)) {
+    memcpy(packet.data() + InternalConstants::Protocol::kHeaderSize, payload,
+           payloadLength);
+  }
+
+  uint8_t ckA = 0U;
+  uint8_t ckB = 0U;
+  calculateUbxChecksum(payload, static_cast<uint16_t>(payloadLength), messageClass,
+                       messageId, &ckA, &ckB);
+
+  const size_t checksumOffset =
+      InternalConstants::Protocol::kHeaderSize + payloadLength;
+  packet[checksumOffset] = ckA;
+  packet[checksumOffset + 1U] = ckB;
+
+  return notifyCharacteristicValue(characteristic, packet.data(),
+                                   checksumOffset + InternalConstants::Protocol::kChecksumSize,
+                                   allowChunking);
 }
 
 // ============================================================================
@@ -755,7 +850,10 @@ void initializeGnssOrHalt() {
 
   configureGnssUartOutput();
   gGnss.setAutoPVT(true);
-  gGnss.setDynamicModel(DYN_MODEL_AUTOMOTIVE);
+  if (!gGnss.setDynamicModel(
+          static_cast<dynModel>(gState.gnssConfiguration.dynamicPlatformModel))) {
+    Serial.println("Failed to apply the configured GNSS dynamic platform model.");
+  }
 
   if (gGnss.setNavigationFrequency(UserSettings::Gnss::kNavigationRateHz)) {
     Serial.printf("GPS update rate set to %u Hz.\n",
@@ -765,6 +863,130 @@ void initializeGnssOrHalt() {
   }
 
   configureGnssConstellations();
+}
+
+// ============================================================================
+// RaceBox Command Handling
+// ============================================================================
+bool sendRaceBoxReply(uint8_t messageId, const uint8_t *payload,
+                      size_t payloadLength) {
+  return sendUbxPacket(gBle.tx, InternalConstants::Protocol::kMessageClass, messageId,
+                       payload, payloadLength, true);
+}
+
+void sendRaceBoxAckNack(bool acknowledged, uint8_t messageId) {
+  const uint8_t payload[2] = {InternalConstants::Protocol::kMessageClass, messageId};
+  const uint8_t replyId = acknowledged ? InternalConstants::Protocol::kAckMessageId
+                                       : InternalConstants::Protocol::kNackMessageId;
+
+  if (!sendRaceBoxReply(replyId, payload, sizeof(payload))) {
+    Serial.printf("Failed to send RaceBox %s for 0x%02X.\n",
+                  acknowledged ? "ACK" : "NACK",
+                  static_cast<unsigned int>(messageId));
+  }
+}
+
+bool isValidDynamicPlatformModel(uint8_t dynamicPlatformModel) {
+  return dynamicPlatformModel >=
+             InternalConstants::Protocol::GnssConfiguration::
+                 kMinimumDynamicPlatformModel &&
+         dynamicPlatformModel <=
+             InternalConstants::Protocol::GnssConfiguration::
+                 kMaximumDynamicPlatformModel;
+}
+
+bool applyGnssConfiguration(const RaceBoxGnssConfiguration &configuration) {
+  if (!isValidDynamicPlatformModel(configuration.dynamicPlatformModel)) {
+    return false;
+  }
+
+  if (!gGnss.setDynamicModel(
+          static_cast<dynModel>(configuration.dynamicPlatformModel))) {
+    Serial.printf("Failed to apply GNSS dynamic platform model %u.\n",
+                  static_cast<unsigned int>(configuration.dynamicPlatformModel));
+    return false;
+  }
+
+  if (!gGnss.saveConfigSelective(VAL_CFG_SUBSEC_NAVCONF)) {
+    Serial.println("Failed to save GNSS navigation configuration.");
+    return false;
+  }
+
+  gState.gnssConfiguration = configuration;
+  Serial.printf(
+      "Applied GNSS config: dynModel=%u 3dSpeed=%u minHAcc=%.1fm\n",
+      static_cast<unsigned int>(configuration.dynamicPlatformModel),
+      configuration.enable3dSpeed ? 1U : 0U,
+      static_cast<float>(configuration.minimumHorizontalAccuracyDecimeters) / 10.0f);
+  return true;
+}
+
+void sendGnssConfigurationReply() {
+  const uint8_t payload[InternalConstants::Protocol::GnssConfiguration::kPayloadSize] = {
+      gState.gnssConfiguration.dynamicPlatformModel,
+      static_cast<uint8_t>(gState.gnssConfiguration.enable3dSpeed ? 1U : 0U),
+      gState.gnssConfiguration.minimumHorizontalAccuracyDecimeters,
+  };
+
+  if (!sendRaceBoxReply(InternalConstants::Protocol::kGnssConfigurationMessageId,
+                        payload, sizeof(payload))) {
+    Serial.println("Failed to send the current GNSS configuration.");
+  }
+}
+
+void handleGnssConfigurationCommand(const uint8_t *payload, size_t payloadLength) {
+  if (payloadLength == 0U) {
+    sendGnssConfigurationReply();
+    return;
+  }
+
+  if ((payload == nullptr) ||
+      (payloadLength !=
+       InternalConstants::Protocol::GnssConfiguration::kPayloadSize)) {
+    sendRaceBoxAckNack(false, InternalConstants::Protocol::kGnssConfigurationMessageId);
+    return;
+  }
+
+  RaceBoxGnssConfiguration configuration;
+  configuration.dynamicPlatformModel = payload[0];
+  configuration.enable3dSpeed = payload[1] != 0U;
+  configuration.minimumHorizontalAccuracyDecimeters = payload[2];
+
+  if (applyGnssConfiguration(configuration)) {
+    sendRaceBoxAckNack(true, InternalConstants::Protocol::kGnssConfigurationMessageId);
+    return;
+  }
+
+  sendRaceBoxAckNack(false, InternalConstants::Protocol::kGnssConfigurationMessageId);
+}
+
+void dispatchReceivedUbxFrame(const uint8_t *frame, size_t length) {
+  if (!isValidUbxFrame(frame, length)) {
+    Serial.println("Dropping BLE RX frame with an invalid checksum.");
+    return;
+  }
+
+  const uint8_t messageClass = frame[2];
+  const uint8_t messageId = frame[3];
+  const uint16_t payloadLength =
+      static_cast<uint16_t>(frame[4]) |
+      (static_cast<uint16_t>(frame[5]) << 8U);
+  const uint8_t *payload = frame + InternalConstants::Protocol::kHeaderSize;
+
+  if (messageClass != InternalConstants::Protocol::kMessageClass) {
+    Serial.printf(
+        "Ignoring UBX command 0x%02X 0x%02X until generic pass-through is implemented.\n",
+        static_cast<unsigned int>(messageClass),
+        static_cast<unsigned int>(messageId));
+    return;
+  }
+
+  if (messageId == InternalConstants::Protocol::kGnssConfigurationMessageId) {
+    handleGnssConfigurationCommand(payload, payloadLength);
+    return;
+  }
+
+  sendRaceBoxAckNack(false, messageId);
 }
 
 // ============================================================================
@@ -877,6 +1099,39 @@ void initializeBleOrHalt() {
 // ============================================================================
 // RaceBox Packet Assembly
 // ============================================================================
+uint32_t getMinimumHorizontalAccuracyThresholdMillimeters() {
+  return static_cast<uint32_t>(
+             gState.gnssConfiguration.minimumHorizontalAccuracyDecimeters) *
+         InternalConstants::Protocol::GnssConfiguration::kDecimeterToMillimeter;
+}
+
+bool isReportedFixValid(const UBX_NAV_PVT_t *navPvtPacket) {
+  if (navPvtPacket == nullptr) {
+    return false;
+  }
+
+  const auto &navData = navPvtPacket->data;
+  return navData.flags.bits.gnssFixOK &&
+         (navData.hAcc <= getMinimumHorizontalAccuracyThresholdMillimeters());
+}
+
+int32_t getReportedSpeedMillimetersPerSecond(const UBX_NAV_PVT_t *navPvtPacket) {
+  if (navPvtPacket == nullptr) {
+    return 0;
+  }
+
+  const auto &navData = navPvtPacket->data;
+  if (!gState.gnssConfiguration.enable3dSpeed) {
+    return navData.gSpeed;
+  }
+
+  const int64_t horizontalSpeed = static_cast<int64_t>(navData.gSpeed);
+  const int64_t verticalSpeed = static_cast<int64_t>(navData.velD);
+  const double speed3d = std::sqrt(static_cast<double>(
+      (horizontalSpeed * horizontalSpeed) + (verticalSpeed * verticalSpeed)));
+  return static_cast<int32_t>(std::lround(speed3d));
+}
+
 uint8_t buildValidityFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   const auto &navData = navPvtPacket->data;
   uint8_t flags = 0U;
@@ -898,7 +1153,7 @@ uint8_t buildFixStatusFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   const auto &navData = navPvtPacket->data;
   uint8_t flags = 0U;
 
-  if (navData.flags.bits.gnssFixOK) {
+  if (isReportedFixValid(navPvtPacket)) {
     flags |= (1U << 0U);
   }
   if (navData.flags.bits.diffSoln) {
@@ -1005,7 +1260,7 @@ void populateRaceBoxPayload(const UBX_NAV_PVT_t *navPvtPacket) {
       navData.vAcc);
   writeLittleEndian(gTxPayloadBuffer,
                     InternalConstants::Protocol::Offset::kGroundSpeed,
-                    navData.gSpeed);
+                    getReportedSpeedMillimetersPerSecond(navPvtPacket));
   writeLittleEndian(
       gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHeadingOfMotion,
       navData.headMot);
