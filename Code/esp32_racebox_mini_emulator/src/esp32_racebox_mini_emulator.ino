@@ -1,4 +1,5 @@
 #include <Adafruit_MPU6050.h>
+#include <Adafruit_HMC5883_U.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
@@ -33,7 +34,7 @@ constexpr int kRxPin = 16;
 constexpr int kTxPin = 17;
 constexpr uint32_t kBaudRate = 115200UL;
 constexpr uint32_t kFactoryBaudRate = 9600UL;
-constexpr uint8_t kNavigationRateHz = 25U;
+constexpr uint8_t kNavigationRateHz = 20U;
 
 struct ConstellationSetting {
   sfe_ublox_gnss_ids_e id;
@@ -60,6 +61,33 @@ constexpr mpu6050_accel_range_t kAccelRange = MPU6050_RANGE_8_G;
 constexpr mpu6050_gyro_range_t kGyroRange = MPU6050_RANGE_500_DEG;
 constexpr mpu6050_bandwidth_t kFilterBandwidth = MPU6050_BAND_21_HZ;
 }  // namespace Imu
+
+namespace Magnetometer {
+constexpr uint8_t kI2cAddress = HMC5883_ADDRESS_MAG;
+constexpr uint32_t kSampleIntervalMs = 67UL;  // HMC5883L default is about 15 Hz
+constexpr float kFilterAlpha = 0.5f;
+constexpr hmc5883MagGain kGain = HMC5883_MAGGAIN_1_3;
+
+// Tune these after mounting the sensor. Declination converts magnetic north to
+// true north; heading offset compensates for board/enclosure orientation.
+constexpr float kDeclinationDegrees = 0.0f;
+constexpr float kHeadingOffsetDegrees = 0.0f;
+constexpr float kHardIronOffsetXGauss = 0.0f;
+constexpr float kHardIronOffsetYGauss = 0.0f;
+constexpr float kHardIronOffsetZGauss = 0.0f;
+constexpr float kSoftIronScaleX = 1.0f;
+constexpr float kSoftIronScaleY = 1.0f;
+constexpr float kSoftIronScaleZ = 1.0f;
+constexpr bool kSwapXY = false;
+constexpr bool kInvertX = false;
+constexpr bool kInvertY = false;
+constexpr bool kInvertZ = false;
+
+// Keep false for strict RaceBox compatibility. Set true if the compass should
+// replace GNSS course-over-ground in heading fields.
+constexpr bool kUseForRaceBoxHeading = false;
+constexpr uint32_t kHeadingAccuracyDegrees1e5 = 500000UL;  // 5 degrees
+}  // namespace Magnetometer
 
 namespace Ble {
 constexpr uint16_t kRequestedMtu = 128U;
@@ -126,6 +154,9 @@ namespace Conversion {
 constexpr float kMetersPerSecondSquaredToMilliG = 1000.0f / 9.80665f;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kRadiansPerSecondToCentiDegrees = 18000.0f / kPi;
+constexpr float kRadiansToDegrees = 180.0f / kPi;
+constexpr float kDegreesToUbxHeading = 100000.0f;
+constexpr float kMicroteslaPerGauss = 100.0f;
 constexpr double kLatLonToDegrees = 1e-7;
 }  // namespace Conversion
 
@@ -235,6 +266,13 @@ struct FilteredImuState {
   float gyroZ = 0.0f;
 };
 
+struct FilteredMagnetometerState {
+  float xGauss = 0.0f;
+  float yGauss = 0.0f;
+  float zGauss = 0.0f;
+  float headingDegrees = 0.0f;
+};
+
 struct RuntimeCounters {
   unsigned int blePacketCount = 0U;
   unsigned int gnssUpdateCount = 0U;
@@ -242,6 +280,7 @@ struct RuntimeCounters {
 
 struct RuntimeTimers {
   unsigned long lastAccelReadMs = 0UL;
+  unsigned long lastMagnetometerReadMs = 0UL;
   unsigned long lastDisconnectedBlinkMs = 0UL;
   unsigned long lastRateReportMs = 0UL;
 };
@@ -259,11 +298,15 @@ struct RaceBoxGnssConfiguration {
 struct RuntimeState {
   char deviceSerialNumber[InternalConstants::DeviceIdentity::kSerialDigits + 1U] = {};
   FilteredImuState filteredImu{};
+  FilteredMagnetometerState filteredMagnetometer{};
   RuntimeCounters counters{};
   RuntimeTimers timers{};
   RaceBoxGnssConfiguration gnssConfiguration{};
   bool latestNavDopValid = false;
   bool latestNavPvtValid = false;
+  bool imuAvailable = false;
+  bool magnetometerAvailable = false;
+  bool magnetometerSampleValid = false;
   bool ubxPassthroughActive = false;
   bool deviceConnected = false;
   bool previousDeviceConnected = false;
@@ -298,6 +341,7 @@ struct UbxFrameAssembler {
 SFE_UBLOX_GNSS gGnss;
 HardwareSerial gGpsSerial(2);
 Adafruit_MPU6050 gMpu;
+Adafruit_HMC5883_Unified gMagnetometer(12345);
 
 RuntimeState gState;
 BleHandles gBle;
@@ -379,6 +423,8 @@ class NmeaRxCallbacks : public BLECharacteristicCallbacks {
 // ============================================================================
 // Utility Helpers
 // ============================================================================
+[[noreturn]] void haltWithMessage(const char *message);
+
 [[noreturn]] void haltWithMessage(const char *message) {
   Serial.println(message);
   while (true) {
@@ -548,6 +594,18 @@ float applyExponentialMovingAverage(float alpha, float sample, float filteredVal
   return (alpha * sample) + ((1.0f - alpha) * filteredValue);
 }
 
+float normalizeDegrees(float degrees) {
+  while (degrees < 0.0f) {
+    degrees += 360.0f;
+  }
+
+  while (degrees >= 360.0f) {
+    degrees -= 360.0f;
+  }
+
+  return degrees;
+}
+
 int16_t saturatingFloatToInt16(float value) {
   if (value > static_cast<float>(std::numeric_limits<int16_t>::max())) {
     return std::numeric_limits<int16_t>::max();
@@ -715,11 +773,13 @@ void seedImuFilterState() {
   gState.filteredImu.gyroZ = gyroEvent.gyro.z;
 }
 
-void initializeImuOrHalt() {
+void initializeImu() {
   if (!gMpu.begin()) {
-    haltWithMessage("Failed to find MPU6050 chip.");
+    Serial.println("MPU6050 device not found; continuing without IMU data.");
+    return;
   }
 
+  gState.imuAvailable = true;
   gMpu.setAccelerometerRange(UserSettings::Imu::kAccelRange);
   gMpu.setGyroRange(UserSettings::Imu::kGyroRange);
   gMpu.setFilterBandwidth(UserSettings::Imu::kFilterBandwidth);
@@ -727,6 +787,10 @@ void initializeImuOrHalt() {
 }
 
 void updateFilteredImu(unsigned long now) {
+  if (!gState.imuAvailable) {
+    return;
+  }
+
   if (gState.timers.lastAccelReadMs == 0UL) {
     gState.timers.lastAccelReadMs = now;
   }
@@ -770,6 +834,10 @@ void updateFilteredImu(unsigned long now) {
 EncodedImuSample encodeFilteredImuSample() {
   EncodedImuSample encoded;
 
+  if (!gState.imuAvailable) {
+    return encoded;
+  }
+
   encoded.accelX = saturatingFloatToInt16(
       gState.filteredImu.accelX *
       InternalConstants::Conversion::kMetersPerSecondSquaredToMilliG);
@@ -791,6 +859,159 @@ EncodedImuSample encodeFilteredImuSample() {
       InternalConstants::Conversion::kRadiansPerSecondToCentiDegrees);
 
   return encoded;
+}
+
+// ============================================================================
+// Magnetometer Setup and Sampling
+// ============================================================================
+float calibrateMagnetometerAxis(float value, float offset, float scale) {
+  return (value - offset) * scale;
+}
+
+void applyMagnetometerAxisSettings(float &xGauss, float &yGauss, float &zGauss) {
+  xGauss = calibrateMagnetometerAxis(
+      xGauss, UserSettings::Magnetometer::kHardIronOffsetXGauss,
+      UserSettings::Magnetometer::kSoftIronScaleX);
+  yGauss = calibrateMagnetometerAxis(
+      yGauss, UserSettings::Magnetometer::kHardIronOffsetYGauss,
+      UserSettings::Magnetometer::kSoftIronScaleY);
+  zGauss = calibrateMagnetometerAxis(
+      zGauss, UserSettings::Magnetometer::kHardIronOffsetZGauss,
+      UserSettings::Magnetometer::kSoftIronScaleZ);
+
+  if (UserSettings::Magnetometer::kSwapXY) {
+    std::swap(xGauss, yGauss);
+  }
+  if (UserSettings::Magnetometer::kInvertX) {
+    xGauss = -xGauss;
+  }
+  if (UserSettings::Magnetometer::kInvertY) {
+    yGauss = -yGauss;
+  }
+  if (UserSettings::Magnetometer::kInvertZ) {
+    zGauss = -zGauss;
+  }
+}
+
+float calculateMagnetometerHeadingDegrees(float xGauss, float yGauss) {
+  const float rawHeadingDegrees =
+      std::atan2(yGauss, xGauss) *
+      InternalConstants::Conversion::kRadiansToDegrees;
+  return normalizeDegrees(rawHeadingDegrees +
+                          UserSettings::Magnetometer::kDeclinationDegrees +
+                          UserSettings::Magnetometer::kHeadingOffsetDegrees);
+}
+
+bool readCalibratedMagnetometer(float &xGauss, float &yGauss, float &zGauss) {
+  sensors_event_t event;
+  if (!gMagnetometer.getEvent(&event)) {
+    return false;
+  }
+
+  xGauss = event.magnetic.x / InternalConstants::Conversion::kMicroteslaPerGauss;
+  yGauss = event.magnetic.y / InternalConstants::Conversion::kMicroteslaPerGauss;
+  zGauss = event.magnetic.z / InternalConstants::Conversion::kMicroteslaPerGauss;
+
+  applyMagnetometerAxisSettings(xGauss, yGauss, zGauss);
+  return true;
+}
+
+void storeMagnetometerSample(float xGauss, float yGauss, float zGauss) {
+  if (!gState.magnetometerSampleValid) {
+    gState.filteredMagnetometer.xGauss = xGauss;
+    gState.filteredMagnetometer.yGauss = yGauss;
+    gState.filteredMagnetometer.zGauss = zGauss;
+  } else {
+    gState.filteredMagnetometer.xGauss = applyExponentialMovingAverage(
+        UserSettings::Magnetometer::kFilterAlpha, xGauss,
+        gState.filteredMagnetometer.xGauss);
+    gState.filteredMagnetometer.yGauss = applyExponentialMovingAverage(
+        UserSettings::Magnetometer::kFilterAlpha, yGauss,
+        gState.filteredMagnetometer.yGauss);
+    gState.filteredMagnetometer.zGauss = applyExponentialMovingAverage(
+        UserSettings::Magnetometer::kFilterAlpha, zGauss,
+        gState.filteredMagnetometer.zGauss);
+  }
+
+  gState.filteredMagnetometer.headingDegrees = calculateMagnetometerHeadingDegrees(
+      gState.filteredMagnetometer.xGauss, gState.filteredMagnetometer.yGauss);
+  gState.magnetometerSampleValid = true;
+}
+
+void configureMagnetometer() {
+  gMagnetometer.setMagGain(UserSettings::Magnetometer::kGain);
+}
+
+bool isMagnetometerPresent() {
+  Wire.beginTransmission(UserSettings::Magnetometer::kI2cAddress);
+  return Wire.endTransmission() == 0;
+}
+
+void initializeMagnetometer() {
+  Wire.begin();
+
+  if (!isMagnetometerPresent()) {
+    Serial.println("HMC5883L magnetometer not found; continuing without compass data.");
+    return;
+  }
+
+  if (!gMagnetometer.begin()) {
+    Serial.println(
+        "HMC5883L magnetometer initialization failed; continuing without compass data.");
+    return;
+  }
+
+  configureMagnetometer();
+  gState.magnetometerAvailable = true;
+
+  float xGauss = 0.0f;
+  float yGauss = 0.0f;
+  float zGauss = 0.0f;
+  if (readCalibratedMagnetometer(xGauss, yGauss, zGauss)) {
+    storeMagnetometerSample(xGauss, yGauss, zGauss);
+  }
+
+  Serial.println("HMC5883L magnetometer initialized.");
+}
+
+void updateFilteredMagnetometer(unsigned long now) {
+  if (!gState.magnetometerAvailable) {
+    return;
+  }
+
+  if (gState.timers.lastMagnetometerReadMs == 0UL) {
+    gState.timers.lastMagnetometerReadMs = now;
+  }
+
+  bool shouldSample = false;
+  while ((now - gState.timers.lastMagnetometerReadMs) >=
+         UserSettings::Magnetometer::kSampleIntervalMs) {
+    gState.timers.lastMagnetometerReadMs +=
+        UserSettings::Magnetometer::kSampleIntervalMs;
+    shouldSample = true;
+  }
+
+  if (!shouldSample) {
+    return;
+  }
+
+  float xGauss = 0.0f;
+  float yGauss = 0.0f;
+  float zGauss = 0.0f;
+  if (readCalibratedMagnetometer(xGauss, yGauss, zGauss)) {
+    storeMagnetometerSample(xGauss, yGauss, zGauss);
+  }
+}
+
+bool shouldUseMagnetometerForReportedHeading() {
+  return UserSettings::Magnetometer::kUseForRaceBoxHeading &&
+         gState.magnetometerSampleValid;
+}
+
+int32_t encodeMagnetometerHeadingDegrees1e5() {
+  return static_cast<int32_t>(std::lround(
+      normalizeDegrees(gState.filteredMagnetometer.headingDegrees) *
+      InternalConstants::Conversion::kDegreesToUbxHeading));
 }
 
 // ============================================================================
@@ -1320,6 +1541,30 @@ int32_t getReportedSpeedMillimetersPerSecond(const UBX_NAV_PVT_t *navPvtPacket) 
   return static_cast<int32_t>(std::lround(speed3d));
 }
 
+int32_t getReportedHeadingDegrees1e5(const UBX_NAV_PVT_t *navPvtPacket) {
+  if (shouldUseMagnetometerForReportedHeading()) {
+    return encodeMagnetometerHeadingDegrees1e5();
+  }
+
+  if (navPvtPacket == nullptr) {
+    return 0;
+  }
+
+  return navPvtPacket->data.headMot;
+}
+
+uint32_t getReportedHeadingAccuracyDegrees1e5(const UBX_NAV_PVT_t *navPvtPacket) {
+  if (shouldUseMagnetometerForReportedHeading()) {
+    return UserSettings::Magnetometer::kHeadingAccuracyDegrees1e5;
+  }
+
+  if (navPvtPacket == nullptr) {
+    return 0U;
+  }
+
+  return navPvtPacket->data.headAcc;
+}
+
 uint8_t buildValidityFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   const auto &navData = navPvtPacket->data;
   uint8_t flags = 0U;
@@ -1347,7 +1592,7 @@ uint8_t buildFixStatusFlags(const UBX_NAV_PVT_t *navPvtPacket) {
   if (navData.flags.bits.diffSoln) {
     flags |= (1U << 1U);
   }
-  if (navData.flags.bits.headVehValid) {
+  if (navData.flags.bits.headVehValid || shouldUseMagnetometerForReportedHeading()) {
     flags |= (1U << 5U);
   }
   flags |= static_cast<uint8_t>(navData.flags.bits.carrSoln << 6U);
@@ -1451,13 +1696,13 @@ void populateRaceBoxPayload(const UBX_NAV_PVT_t *navPvtPacket) {
                     getReportedSpeedMillimetersPerSecond(navPvtPacket));
   writeLittleEndian(
       gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHeadingOfMotion,
-      navData.headMot);
+      getReportedHeadingDegrees1e5(navPvtPacket));
   writeLittleEndian(gTxPayloadBuffer,
                     InternalConstants::Protocol::Offset::kSpeedAccuracy,
                     navData.sAcc);
   writeLittleEndian(
       gTxPayloadBuffer, InternalConstants::Protocol::Offset::kHeadingAccuracy,
-      navData.headAcc);
+      getReportedHeadingAccuracyDegrees1e5(navPvtPacket));
   writeLittleEndian(gTxPayloadBuffer, InternalConstants::Protocol::Offset::kPdop,
                     navData.pDOP);
   writeLittleEndian(gTxPayloadBuffer,
@@ -1688,7 +1933,8 @@ void sendNmeaSentences(const UBX_NAV_PVT_t *navPvtPacket) {
   snprintf(speedField, sizeof(speedField), "%.3f",
            (static_cast<double>(navData.gSpeed) / 1000.0) * 1.9438444924406);
   snprintf(courseField, sizeof(courseField), "%.2f",
-           static_cast<double>(navData.headMot) / 100000.0);
+           static_cast<double>(getReportedHeadingDegrees1e5(navPvtPacket)) /
+               100000.0);
 
   const char modeIndicator = getNmeaModeIndicator(navPvtPacket);
   const char rmcStatus = isReportedFixValid(navPvtPacket) ? 'A' : 'V';
@@ -1774,6 +2020,8 @@ void reportRatesIfDue(unsigned long now, const UBX_NAV_PVT_t *navPvtPacket) {
   unsigned long horizontalAccuracy = 0UL;
   double latitude = 0.0;
   double longitude = 0.0;
+  float compassHeading = 0.0f;
+  const bool compassAvailable = gState.magnetometerSampleValid;
 
   if (navPvtPacket != nullptr) {
     const auto &navData = navPvtPacket->data;
@@ -1786,11 +2034,18 @@ void reportRatesIfDue(unsigned long now, const UBX_NAV_PVT_t *navPvtPacket) {
                 InternalConstants::Conversion::kLatLonToDegrees;
   }
 
+  if (compassAvailable) {
+    compassHeading = gState.filteredMagnetometer.headingDegrees;
+  }
+
   Serial.printf(
       "BLE packet rate: %.2f Hz | GNSS update rate: %.2f Hz | SVs: %u | Fix: %u | "
-      "HAcc: %lu mm | Lat: %.7f Lon: %.7f\n",
+      "HAcc: %lu mm | Lat: %.7f Lon: %.7f | Compass: %s",
       bleRate, gnssRate, satellites, fixType, horizontalAccuracy, latitude,
-      longitude);
+      longitude, compassAvailable ? "" : "unavailable\n");
+  if (compassAvailable) {
+    Serial.printf("%.1f deg\n", compassHeading);
+  }
 
   gState.counters.blePacketCount = 0U;
   gState.counters.gnssUpdateCount = 0U;
@@ -1838,7 +2093,8 @@ void setup() {
   pinMode(UserSettings::Device::kStatusLedPin, OUTPUT);
 
   validateDeviceNameOrHalt();
-  initializeImuOrHalt();
+  initializeImu();
+  initializeMagnetometer();
   initializeGnssOrHalt();
   initializeBleOrHalt();
 
@@ -1854,6 +2110,7 @@ void loop() {
     gGnss.checkUblox();
   }
   updateFilteredImu(now);
+  updateFilteredMagnetometer(now);
   updateConnectionLed(now);
   processGnssData(now);
   updateBleAdvertisingState();

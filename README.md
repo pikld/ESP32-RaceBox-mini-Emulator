@@ -3,7 +3,7 @@
 
 ## Overview
 
-This project provides firmware for an ESP32-based device that acts as a high-performance GPS/IMU Bluetooth Low Energy (BLE) broadcaster. It integrates a U-blox GNSS module for precise position, velocity, and timing data at 25Hz, along with an MPU6050 accelerometer and gyroscope for motion sensing.
+This project provides firmware for an ESP32-based device that acts as a high-performance GPS/IMU Bluetooth Low Energy (BLE) broadcaster. It integrates a U-blox GNSS module for precise position, velocity, and timing data at 25Hz, along with an MPU6050 accelerometer and gyroscope for motion sensing. A QMC5883P magnetometer is also supported for optional compass heading telemetry.
 
 The device is designed to be housed in a custom 3D-printed enclosure, with design files included in this repository.
 
@@ -21,7 +21,8 @@ The device is designed to be housed in a custom 3D-printed enclosure, with desig
 
 - **High-Resolution GPS Data**: Achieves 25Hz update rate using a U-blox GNSS module.  
 - **Multi-Constellation Support**: Leverages GPS, Galileo, GLONASS, and BeiDou for enhanced accuracy and reliability.  
-- **Integrated IMU**: Captures 3-axis accelerometer (`±8g`) and 3-axis gyroscope (`±500 deg/s`) data from the MPU6050.  
+- **Integrated IMU**: Captures 3-axis accelerometer (`±8g`) and 3-axis gyroscope (`±500 deg/s`) data from the MPU6050.
+- **Optional Compass**: Reads QMC5883P magnetometer data through the Adafruit HMC5883 Arduino library from a ublox M8.
 - **Real-time BLE Streaming**: Transmits a custom 88-byte data packet containing comprehensive GNSS and IMU information over BLE.  
 - **Automatic Configuration**: Robust GPS initialization.
 - **Custom RaceBox Protocol**: Data is encapsulated in a UBX-like custom protocol for efficient transmission.  
@@ -43,7 +44,8 @@ To build this project, you'll need the following components:
     
   Any M10 based U-blox modules should work, the output rate may vary but you should be able to get 25hz with just GPS enabled. But YMMV.
   
-- **MPU6050 Accelerometer/Gyroscope Module**: (https://a.co/d/dCMwffg or similar)  
+- **MPU6050 Accelerometer/Gyroscope Module**: (https://a.co/d/dCMwffg or similar)
+- **Optional QMC5883P Magnetometer Module**: included on some `5883` GNSS/compass modules, or available as a separate I2C breakout.
 - **24AWG Hook-up Wire/Jumper Wires** or just use the wiring that comes with GNSS module, its perfect for this application.
 - **M3x6 Screws** (2)    
 - **Soldering Iron & Solder**
@@ -65,10 +67,16 @@ The electronics should cost under 40$.
 - ESP32 GND <--> GNSS GND  
 
 **ESP32 <--> MPU6050:**
-- ESP32 GPIO 21 (SDA) <--> MPU6050 SDA  
-- ESP32 GPIO 22 (SCL) <--> MPU6050 SCL  
+- ESP32 GPIO 21 (SDA) <--> MPU6050 SDA
+- ESP32 GPIO 22 (SCL) <--> MPU6050 SCL
 - ESP32 5V or 3.3V <--> MPU6050 VCC *(check voltage requirements)*
-- ESP32 GND <--> MPU6050 GND  
+- ESP32 GND <--> MPU6050 GND
+
+**ESP32 <--> QMC5883P (optional, shared I2C bus):**
+- ESP32 GPIO 21 (SDA) <--> QMC5883P SDA
+- ESP32 GPIO 22 (SCL) <--> QMC5883P SCL
+- ESP32 5V or 3.3V <--> QMC5883P VCC *(check voltage requirements)*
+- ESP32 GND <--> QMC5883P GND
 
 ---
 
@@ -106,6 +114,7 @@ Download from the [official Arduino website](https://www.arduino.cc/en/software)
 ### 3. Install Libraries:
 - Go to Sketch > Include Library > Manage Libraries... and install the following:
     - Adafruit MPU6050
+    - Adafruit QMC5883P
     - Adafruit Unified Sensor
     - SparkFun u-blox GNSS Arduino Library (ensure it's version 2)
 
